@@ -1,4 +1,4 @@
-/*	$OpenBSD: sshbuf-misc.c,v 1.16 2020/06/22 05:54:10 djm Exp $	*/
+/*	$OpenBSD: sshbuf-misc.c,v 1.23 2026/03/28 05:10:25 djm Exp $	*/
 /*
  * Copyright (c) 2011 Damien Miller
  *
@@ -22,14 +22,13 @@
 #include <netinet/in.h>
 #include <errno.h>
 #include <stdlib.h>
-#ifdef HAVE_STDINT_H
-# include <stdint.h>
-#endif
+#include <stdint.h>
 #include <stdio.h>
 #include <limits.h>
 #include <string.h>
 #include <resolv.h>
 #include <ctype.h>
+#include <unistd.h>
 
 #include "ssherr.h"
 #define SSHBUF_INTERNAL
@@ -65,12 +64,12 @@ sshbuf_dump_data(const void *s, size_t len, FILE *f)
 void
 sshbuf_dump(const struct sshbuf *buf, FILE *f)
 {
-	fprintf(f, "buffer %p len = %zu\n", buf, sshbuf_len(buf));
+	fprintf(f, "buffer len = %zu\n", sshbuf_len(buf));
 	sshbuf_dump_data(sshbuf_ptr(buf), sshbuf_len(buf), f);
 }
 
 char *
-sshbuf_dtob16(struct sshbuf *buf)
+sshbuf_dtob16(const struct sshbuf *buf)
 {
 	size_t i, j, len = sshbuf_len(buf);
 	const u_char *p = sshbuf_ptr(buf);
@@ -86,6 +85,42 @@ sshbuf_dtob16(struct sshbuf *buf)
 		ret[j++] = hex[p[i] & 0xf];
 	}
 	ret[j] = '\0';
+	return ret;
+}
+
+static int
+b16tod(const char v)
+{
+	if (v >= '0' && v <= '9')
+		return v - '0';
+	if (v >= 'a' && v <= 'f')
+		return 10 + v - 'a';
+	if (v >= 'A' && v <= 'F')
+		return 10 + v - 'A';
+	return -1;
+}
+
+struct sshbuf *
+sshbuf_b16tod(const char *b16)
+{
+	struct sshbuf *ret;
+	size_t o;
+	int r, v1, v2;
+
+	if ((ret = sshbuf_new()) == NULL)
+		return NULL;
+	for (o = 0; b16[o] != '\0'; o += 2) {
+		if ((v1 = b16tod(b16[o])) == -1 ||
+		    (v2 = b16tod(b16[o + 1])) == -1) {
+			sshbuf_free(ret);
+			return NULL;
+		}
+		if ((r = sshbuf_put_u8(ret, (u_char)((v1 << 4) | v2))) != 0) {
+			sshbuf_free(ret);
+			return NULL;
+		}
+	}
+	/* success */
 	return ret;
 }
 
@@ -175,6 +210,9 @@ sshbuf_dtourlb64(const struct sshbuf *d, struct sshbuf *b64, int wrap)
 	struct sshbuf *b = NULL;
 	size_t i, l;
 
+	if (sshbuf_len(d) == 0)
+		return 0;
+
 	if ((b = sshbuf_new()) == NULL)
 		return SSH_ERR_ALLOC_FAIL;
 	/* Encode using regular base64; we'll transform it once done */
@@ -217,7 +255,7 @@ sshbuf_dup_string(struct sshbuf *buf)
 	size_t l = sshbuf_len(buf);
 	char *r;
 
-	if (s == NULL || l > SIZE_MAX)
+	if (s == NULL || l >= SIZE_MAX)
 		return NULL;
 	/* accept a nul only as the last character in the buffer */
 	if (l > 0 && (p = memchr(s, '\0', l)) != NULL) {
@@ -249,6 +287,20 @@ sshbuf_cmp(const struct sshbuf *b, size_t offset,
 }
 
 int
+sshbuf_equals(const struct sshbuf *a, const struct sshbuf *b)
+{
+	if (sshbuf_ptr(a) == NULL || sshbuf_ptr(b) == NULL)
+		return SSH_ERR_INTERNAL_ERROR;
+	if (sshbuf_len(a) != sshbuf_len(b))
+		return SSH_ERR_MESSAGE_INCOMPLETE;
+	if (sshbuf_len(a) == 0)
+		return 0;
+	if (memcmp(sshbuf_ptr(a), sshbuf_ptr(b), sshbuf_len(a)) != 0)
+		return SSH_ERR_INVALID_FORMAT;
+	return 0;
+}
+
+int
 sshbuf_find(const struct sshbuf *b, size_t start_offset,
     const void *s, size_t len, size_t *offsetp)
 {
@@ -267,5 +319,41 @@ sshbuf_find(const struct sshbuf *b, size_t start_offset,
 		return SSH_ERR_INVALID_FORMAT;
 	if (offsetp != NULL)
 		*offsetp = (const u_char *)p - sshbuf_ptr(b);
+	return 0;
+}
+
+int
+sshbuf_read(int fd, struct sshbuf *buf, size_t maxlen, size_t *rlen)
+{
+	int r, oerrno;
+	size_t adjust;
+	ssize_t rr;
+	u_char *d;
+
+	if (rlen != NULL)
+		*rlen = 0;
+	if ((r = sshbuf_reserve(buf, maxlen, &d)) != 0)
+		return r;
+	rr = read(fd, d, maxlen);
+	oerrno = errno;
+
+	/* Adjust the buffer to include only what was actually read */
+	if ((adjust = maxlen - (rr > 0 ? rr : 0)) != 0) {
+		if ((r = sshbuf_consume_end(buf, adjust)) != 0) {
+			/* avoid returning uninitialised data to caller */
+			memset(d + rr, '\0', adjust);
+			return SSH_ERR_INTERNAL_ERROR; /* shouldn't happen */
+		}
+	}
+	if (rr < 0) {
+		errno = oerrno;
+		return SSH_ERR_SYSTEM_ERROR;
+	} else if (rr == 0) {
+		errno = EPIPE;
+		return SSH_ERR_SYSTEM_ERROR;
+	}
+	/* success */
+	if (rlen != NULL)
+		*rlen = (size_t)rr;
 	return 0;
 }

@@ -1,4 +1,4 @@
-/* $OpenBSD: kexgexs.c,v 1.43 2021/01/31 22:55:29 djm Exp $ */
+/* $OpenBSD: kexgexs.c,v 1.52 2026/10/30 02:08:03 djm Exp $ */
 /*
  * Copyright (c) 2000 Niels Provos.  All rights reserved.
  * Copyright (c) 2001 Markus Friedl.  All rights reserved.
@@ -27,16 +27,15 @@
 #include "includes.h"
 
 #ifdef WITH_OPENSSL
-
+#include "openbsd-compat/openssl-compat.h"
 
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <signal.h>
 
+#include <openssl/bn.h>
 #include <openssl/dh.h>
-
-#include "openbsd-compat/openssl-compat.h"
 
 #include "sshkey.h"
 #include "cipher.h"
@@ -46,7 +45,6 @@
 #include "packet.h"
 #include "dh.h"
 #include "ssh2.h"
-#include "compat.h"
 #ifdef GSSAPI
 #include "ssh-gss.h"
 #endif
@@ -56,8 +54,8 @@
 #include "sshbuf.h"
 #include "misc.h"
 
-static int input_kex_dh_gex_request(int, u_int32_t, struct ssh *);
-static int input_kex_dh_gex_init(int, u_int32_t, struct ssh *);
+static int input_kex_dh_gex_request(int, uint32_t, struct ssh *);
+static int input_kex_dh_gex_init(int, uint32_t, struct ssh *);
 
 int
 kexgex_server(struct ssh *ssh)
@@ -69,7 +67,7 @@ kexgex_server(struct ssh *ssh)
 }
 
 static int
-input_kex_dh_gex_request(int type, u_int32_t seq, struct ssh *ssh)
+input_kex_dh_gex_request(int type, uint32_t seq, struct ssh *ssh)
 {
 	struct kex *kex = ssh->kex;
 	int r;
@@ -93,15 +91,16 @@ input_kex_dh_gex_request(int type, u_int32_t seq, struct ssh *ssh)
 	nbits = MINIMUM(DH_GRP_MAX, nbits);
 
 	if (kex->max < kex->min || kex->nbits < kex->min ||
-	    kex->max < kex->nbits || kex->max < DH_GRP_MIN) {
+	    kex->max < kex->nbits || kex->max < DH_GRP_MIN ||
+	    kex->min > DH_GRP_MAX) {
 		r = SSH_ERR_DH_GEX_OUT_OF_RANGE;
 		goto out;
 	}
 
 	/* Contact privileged parent */
-	kex->dh = PRIVSEP(choose_dh(min, nbits, max));
+	kex->dh = mm_choose_dh(min, nbits, max);
 	if (kex->dh == NULL) {
-		sshpkt_disconnect(ssh, "no matching DH grp found");
+		(void)sshpkt_disconnect(ssh, "no matching DH grp found");
 		r = SSH_ERR_ALLOC_FAIL;
 		goto out;
 	}
@@ -125,7 +124,7 @@ input_kex_dh_gex_request(int type, u_int32_t seq, struct ssh *ssh)
 }
 
 static int
-input_kex_dh_gex_init(int type, u_int32_t seq, struct ssh *ssh)
+input_kex_dh_gex_init(int type, uint32_t seq, struct ssh *ssh)
 {
 	struct kex *kex = ssh->kex;
 	BIGNUM *dh_client_pub = NULL;
@@ -194,8 +193,16 @@ input_kex_dh_gex_init(int type, u_int32_t seq, struct ssh *ssh)
 	    (r = sshpkt_send(ssh)) != 0)
 		goto out;
 
-	if ((r = kex_derive_keys(ssh, hash, hashlen, shared_secret)) == 0)
-		r = kex_send_newkeys(ssh);
+	if ((r = kex_derive_keys(ssh, hash, hashlen, shared_secret)) != 0 ||
+	    (r = kex_send_newkeys(ssh)) != 0)
+		goto out;
+
+	/* retain copy of hostkey used at initial KEX */
+	if (kex->initial_hostkey == NULL &&
+	    (r = sshkey_from_private(server_host_public,
+	    &kex->initial_hostkey)) != 0)
+		goto out;
+	/* success */
  out:
 	explicit_bzero(hash, sizeof(hash));
 	DH_free(kex->dh);

@@ -23,7 +23,6 @@
 #endif
 
 #include <sys/types.h>
-#include <sys/param.h>
 #include <sys/socket.h> /* For CMSG_* */
 
 #ifdef HAVE_LIMITS_H
@@ -34,6 +33,9 @@
 #endif
 #ifdef HAVE_ENDIAN_H
 # include <endian.h>
+#endif
+#ifdef HAVE_FCNTL_H
+# include <fcntl.h>
 #endif
 #ifdef HAVE_TTYENT_H
 # include <ttyent.h>
@@ -49,6 +51,9 @@
 #endif
 #ifdef HAVE_PATHS_H
 # include <paths.h>
+#endif
+#ifdef HAVE_FCNTL_H
+# include <fcntl.h> /* For AT_FDCWD */
 #endif
 
 /*

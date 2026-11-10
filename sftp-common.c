@@ -1,4 +1,4 @@
-/* $OpenBSD: sftp-common.c,v 1.32 2020/10/18 11:32:02 djm Exp $ */
+/* $OpenBSD: sftp-common.c,v 1.38 2026/10/30 02:28:56 djm Exp $ */
 /*
  * Copyright (c) 2001 Markus Friedl.  All rights reserved.
  * Copyright (c) 2001 Damien Miller.  All rights reserved.
@@ -32,14 +32,13 @@
 #include <grp.h>
 #include <pwd.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <stdarg.h>
+#include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
-#ifdef HAVE_UTIL_H
 #include <util.h>
-#endif
+#include <limits.h>
 
 #include "xmalloc.h"
 #include "ssherr.h"
@@ -137,6 +136,8 @@ decode_attrib(struct sshbuf *b, Attrib *a)
 
 		if ((r = sshbuf_get_u32(b, &count)) != 0)
 			return r;
+		if (count > 0x100000)
+			return SSH_ERR_INVALID_FORMAT;
 		for (i = 0; i < count; i++) {
 			if ((r = sshbuf_get_cstring(b, &type, NULL)) != 0 ||
 			    (r = sshbuf_get_string(b, &data, &dlen)) != 0)
@@ -212,21 +213,25 @@ fx2txt(int status)
  * drwxr-xr-x    5 markus   markus       1024 Jan 13 18:39 .ssh
  */
 char *
-ls_file(const char *name, const struct stat *st, int remote, int si_units)
+ls_file(const char *name, const struct stat *st, int remote, int si_units,
+    const char *user, const char *group)
 {
 	int ulen, glen, sz = 0;
 	struct tm *ltime = localtime(&st->st_mtime);
-	const char *user, *group;
 	char buf[1024], lc[8], mode[11+1], tbuf[12+1], ubuf[11+1], gbuf[11+1];
 	char sbuf[FMT_SCALED_STRSIZE];
 	time_t now;
 
 	strmode(st->st_mode, mode);
 	if (remote) {
-		snprintf(ubuf, sizeof ubuf, "%u", (u_int)st->st_uid);
-		user = ubuf;
-		snprintf(gbuf, sizeof gbuf, "%u", (u_int)st->st_gid);
-		group = gbuf;
+		if (user == NULL) {
+			snprintf(ubuf, sizeof ubuf, "%u", (u_int)st->st_uid);
+			user = ubuf;
+		}
+		if (group == NULL) {
+			snprintf(gbuf, sizeof gbuf, "%u", (u_int)st->st_gid);
+			group = gbuf;
+		}
 		strlcpy(lc, "?", sizeof(lc));
 	} else {
 		user = user_from_uid(st->st_uid, 0);
@@ -246,7 +251,9 @@ ls_file(const char *name, const struct stat *st, int remote, int si_units)
 	ulen = MAXIMUM(strlen(user), 8);
 	glen = MAXIMUM(strlen(group), 8);
 	if (si_units) {
-		fmt_scaled((long long)st->st_size, sbuf);
+		if ((unsigned long long)st->st_size > LLONG_MAX ||
+		    fmt_scaled((long long)st->st_size, sbuf) != 0)
+			strlcpy(sbuf, "error", sizeof(sbuf));
 		snprintf(buf, sizeof buf, "%s %3s %-*s %-*s %8s %s %s",
 		    mode, lc, ulen, user, glen, group,
 		    sbuf, tbuf, name);

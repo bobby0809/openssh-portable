@@ -1,4 +1,4 @@
-#	$OpenBSD: knownhosts-command.sh,v 1.2 2020/12/22 06:47:24 djm Exp $
+#	$OpenBSD: knownhosts-command.sh,v 1.5 2026/06/14 04:08:05 djm Exp $
 #	Placed in the Public Domain.
 
 tid="known hosts command "
@@ -38,8 +38,12 @@ _EOF
 chmod a+x $OBJ/knownhosts_command
 ${SSH} -F $OBJ/ssh_proxy x true && fail "ssh connect succeeded with bad exit"
 
+cp $OBJ/sshd_proxy $OBJ/sshd_proxy.bak
 for keytype in ${SSH_HOSTKEY_TYPES} ; do
-	test "x$keytype" = "xssh-dss" && continue
+	grep -vi HostKeyAlgorithms $OBJ/sshd_proxy.bak > $OBJ/sshd_proxy
+	echo "HostKeyAlgorithms=+$keytype" >> $OBJ/sshd_proxy
+	algs=$keytype
+	test "x$keytype" = "xssh-rsa" && algs=ssh-rsa,rsa-sha2-256,rsa-sha2-512
 	verbose "keytype $keytype"
 	cat > $OBJ/knownhosts_command << _EOF
 #!/bin/sh
@@ -48,6 +52,6 @@ test "x\$1" = "x$keytype" || die "wrong keytype \$1 (expected $keytype)"
 test "x\$3" = "x$LOGNAME" || die "wrong username \$3 (expected $LOGNAME)"
 grep -- "\$1.*\$2" $OBJ/known_hosts
 _EOF
-	${SSH} -F $OBJ/ssh_proxy -oHostKeyAlgorithms=$keytype x true ||
+	${SSH} -F $OBJ/ssh_proxy -oHostKeyAlgorithms=$algs x true ||
 	    fail "ssh connect failed for keytype $x"
 done

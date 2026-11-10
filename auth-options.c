@@ -1,4 +1,4 @@
-/* $OpenBSD: auth-options.c,v 1.95 2021/04/03 06:18:40 djm Exp $ */
+/* $OpenBSD: auth-options.c,v 1.104 2026/10/30 00:58:02 djm Exp $ */
 /*
  * Copyright (c) 2018 Damien Miller <djm@mindrot.org>
  *
@@ -18,17 +18,17 @@
 #include "includes.h"
 
 #include <sys/types.h>
+#include <sys/queue.h>
 
 #include <stdlib.h>
 #include <netdb.h>
 #include <pwd.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdarg.h>
 #include <ctype.h>
 #include <limits.h>
-
-#include "openbsd-compat/sys-queue.h"
 
 #include "xmalloc.h"
 #include "ssherr.h"
@@ -48,10 +48,11 @@ dup_strings(char ***dstp, size_t *ndstp, char **src, size_t nsrc)
 
 	*dstp = NULL;
 	*ndstp = 0;
+
 	if (nsrc == 0)
 		return 0;
-
-	if ((dst = calloc(nsrc, sizeof(*src))) == NULL)
+	if (nsrc >= SIZE_MAX / sizeof(*src) ||
+	    (dst = calloc(nsrc, sizeof(*src))) == NULL)
 		return -1;
 	for (i = 0; i < nsrc; i++) {
 		if ((dst[i] = strdup(src[i])) == NULL) {
@@ -153,6 +154,7 @@ cert_option_list(struct sshauthopt *opts, struct sshbuf *oblob,
 				if (addr_match_cidr_list(NULL, allowed) == -1) {
 					error("Certificate source-address "
 					    "contents invalid");
+					free(allowed);
 					goto out;
 				}
 				opts->required_from_host_cert = allowed;
@@ -282,7 +284,7 @@ handle_permit(const char **optsp, int allow_bare_port,
 	}
 	cp = tmp;
 	/* validate syntax before recording it. */
-	host = hpdelim(&cp);
+	host = hpdelim2(&cp, NULL);
 	if (host == NULL || strlen(host) >= NI_MAXHOST) {
 		free(tmp);
 		free(opt);
@@ -324,6 +326,7 @@ sshauthopt_parse(const char *opts, const char **errstrp)
 	struct sshauthopt *ret = NULL;
 	const char *errstr = "unknown error";
 	uint64_t valid_before;
+	size_t i, l;
 
 	if (errstrp != NULL)
 		*errstrp = NULL;
@@ -397,7 +400,7 @@ sshauthopt_parse(const char *opts, const char **errstrp)
 			    valid_before < ret->valid_before)
 				ret->valid_before = valid_before;
 		} else if (opt_match(&opts, "environment")) {
-			if (ret->nenv > INT_MAX) {
+			if (ret->nenv > SSH_AUTHOPT_ENV_MAX) {
 				errstr = "too many environment strings";
 				goto fail;
 			}
@@ -409,25 +412,41 @@ sshauthopt_parse(const char *opts, const char **errstrp)
 				errstr = "invalid environment string";
 				goto fail;
 			}
-			if ((cp = strdup(opt)) == NULL)
+			if ((cp = strdup(opt)) == NULL) {
+				free(opt);
 				goto alloc_fail;
-			cp[tmp - opt] = '\0'; /* truncate at '=' */
+			}
+			l = (size_t)(tmp - opt);
+			cp[l] = '\0'; /* truncate at '=' */
 			if (!valid_env_name(cp)) {
 				free(cp);
 				free(opt);
 				errstr = "invalid environment string";
 				goto fail;
 			}
-			free(cp);
-			/* Append it. */
-			oarray = ret->env;
-			if ((ret->env = recallocarray(ret->env, ret->nenv,
-			    ret->nenv + 1, sizeof(*ret->env))) == NULL) {
-				free(opt);
-				ret->env = oarray; /* put it back for cleanup */
-				goto alloc_fail;
+			/* Check for duplicates; XXX O(n*log(n)) */
+			for (i = 0; i < ret->nenv; i++) {
+				if (strncmp(ret->env[i], cp, l) == 0 &&
+				    ret->env[i][l] == '=')
+					break;
 			}
-			ret->env[ret->nenv++] = opt;
+			free(cp);
+			/* First match wins */
+			if (i >= ret->nenv) {
+				/* Append it. */
+				oarray = ret->env;
+				if ((ret->env = recallocarray(ret->env,
+				    ret->nenv, ret->nenv + 1,
+				    sizeof(*ret->env))) == NULL) {
+					free(opt);
+					/* put it back for cleanup */
+					ret->env = oarray;
+					goto alloc_fail;
+				}
+				ret->env[ret->nenv++] = opt;
+				opt = NULL; /* transferred */
+			}
+			free(opt);
 		} else if (opt_match(&opts, "permitopen")) {
 			if (handle_permit(&opts, 0, &ret->permitopen,
 			    &ret->npermitopen, &errstr) != 0)
@@ -585,6 +604,7 @@ sshauthopt_merge(const struct sshauthopt *primary,
 	OPTFLAG_AND(no_require_user_presence);
 	/* Restrictive flags are logical-OR (i.e. must be set in either) */
 	OPTFLAG_OR(require_verify);
+	OPTFLAG_OR(restricted);
 #undef OPTFLAG_AND
 
 	/* Earliest expiry time should win */
@@ -686,7 +706,7 @@ serialise_array(struct sshbuf *m, char **a, size_t n)
 {
 	struct sshbuf *b;
 	size_t i;
-	int r;
+	int r = SSH_ERR_INTERNAL_ERROR;
 
 	if (n > INT_MAX)
 		return SSH_ERR_INTERNAL_ERROR;
@@ -695,18 +715,17 @@ serialise_array(struct sshbuf *m, char **a, size_t n)
 		return SSH_ERR_ALLOC_FAIL;
 	}
 	for (i = 0; i < n; i++) {
-		if ((r = sshbuf_put_cstring(b, a[i])) != 0) {
-			sshbuf_free(b);
-			return r;
-		}
+		if ((r = sshbuf_put_cstring(b, a[i])) != 0)
+			goto out;
 	}
 	if ((r = sshbuf_put_u32(m, n)) != 0 ||
-	    (r = sshbuf_put_stringb(m, b)) != 0) {
-		sshbuf_free(b);
-		return r;
-	}
+	    (r = sshbuf_put_stringb(m, b)) != 0)
+		goto out;
 	/* success */
-	return 0;
+	r = 0;
+ out:
+	sshbuf_free(b);
+	return r;
 }
 
 static int
@@ -802,11 +821,17 @@ sshauthopt_serialise(const struct sshauthopt *opts, struct sshbuf *m,
 	    0 : (u_int)opts->force_tun_device)) != 0)
 		return r;
 
-	/* String options; these may be NULL */
+	/*
+	 * String options; these may be NULL. In untrusted mode the
+	 * contents of the forced command are hidden, but its presence
+	 * must be preserved as PermitRootLogin=forced-commands-only
+	 * depends on it.
+	 */
 	if ((r = serialise_nullable_string(m,
 	    untrusted ? "yes" : opts->cert_principals)) != 0 ||
 	    (r = serialise_nullable_string(m,
-	    untrusted ? "true" : opts->force_command)) != 0 ||
+	    (untrusted && opts->force_command != NULL) ?
+	    "true" : opts->force_command)) != 0 ||
 	    (r = serialise_nullable_string(m,
 	    untrusted ? NULL : opts->required_from_host_cert)) != 0 ||
 	    (r = serialise_nullable_string(m,

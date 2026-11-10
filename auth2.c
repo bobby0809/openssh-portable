@@ -1,4 +1,4 @@
-/* $OpenBSD: auth2.c,v 1.161 2021/04/03 06:18:40 djm Exp $ */
+/* $OpenBSD: auth2.c,v 1.177 2026/10/30 06:35:25 djm Exp $ */
 /*
  * Copyright (c) 2000 Markus Friedl.  All rights reserved.
  *
@@ -46,7 +46,6 @@
 #include "sshbuf.h"
 #include "misc.h"
 #include "servconf.h"
-#include "compat.h"
 #include "sshkey.h"
 #include "hostfile.h"
 #include "auth.h"
@@ -58,6 +57,7 @@
 #endif
 #include "monitor_wrap.h"
 #include "digest.h"
+#include "kex.h"
 
 /* import */
 extern ServerOptions options;
@@ -88,10 +88,11 @@ Authmethod *authmethods[] = {
 
 /* protocol */
 
-static int input_service_request(int, u_int32_t, struct ssh *);
-static int input_userauth_request(int, u_int32_t, struct ssh *);
+static int input_service_request(int, uint32_t, struct ssh *);
+static int input_userauth_request(int, uint32_t, struct ssh *);
 
 /* helper */
+static Authmethod *authmethod_byname(const char *);
 static Authmethod *authmethod_lookup(Authctxt *, const char *);
 static char *authmethods_get(Authctxt *authctxt);
 
@@ -144,7 +145,7 @@ userauth_send_banner(struct ssh *ssh, const char *msg)
 	    (r = sshpkt_put_cstring(ssh, "")) != 0 ||	/* language, unused */
 	    (r = sshpkt_send(ssh)) != 0)
 		fatal_fr(r, "send packet");
-	debug("%s: sent", __func__);
+	debug_f("sent");
 }
 
 static void
@@ -155,7 +156,7 @@ userauth_banner(struct ssh *ssh)
 	if (options.banner == NULL)
 		return;
 
-	if ((banner = PRIVSEP(auth2_read_banner())) == NULL)
+	if ((banner = mm_auth2_read_banner()) == NULL)
 		goto done;
 	userauth_send_banner(ssh, banner);
 
@@ -172,14 +173,15 @@ do_authentication2(struct ssh *ssh)
 	Authctxt *authctxt = ssh->authctxt;
 
 	ssh_dispatch_init(ssh, &dispatch_protocol_error);
+	if (ssh->kex->ext_info_c)
+		ssh_dispatch_set(ssh, SSH2_MSG_EXT_INFO, &kex_input_ext_info);
 	ssh_dispatch_set(ssh, SSH2_MSG_SERVICE_REQUEST, &input_service_request);
 	ssh_dispatch_run_fatal(ssh, DISPATCH_BLOCK, &authctxt->success);
 	ssh->authctxt = NULL;
 }
 
-/*ARGSUSED*/
 static int
-input_service_request(int type, u_int32_t seq, struct ssh *ssh)
+input_service_request(int type, uint32_t seq, struct ssh *ssh)
 {
 	Authctxt *authctxt = ssh->authctxt;
 	char *service = NULL;
@@ -212,6 +214,7 @@ input_service_request(int type, u_int32_t seq, struct ssh *ssh)
 		debug("bad service request %s", service);
 		ssh_packet_disconnect(ssh, "bad service request %s", service);
 	}
+	ssh_dispatch_set(ssh, SSH2_MSG_EXT_INFO, &dispatch_protocol_error);
 	r = 0;
  out:
 	free(service);
@@ -219,6 +222,7 @@ input_service_request(int type, u_int32_t seq, struct ssh *ssh)
 }
 
 #define MIN_FAIL_DELAY_SECONDS 0.005
+#define MAX_FAIL_DELAY_SECONDS 5.0
 static double
 user_specific_delay(const char *user)
 {
@@ -234,7 +238,7 @@ user_specific_delay(const char *user)
 	/* 0-4.2 ms of delay */
 	delay = (double)PEEK_U32(hash) / 1000 / 1000 / 1000 / 1000;
 	freezero(hash, len);
-	debug3_f("user specific delay %0.3lfms", delay/1000);
+	debug3_f("user specific delay %0.3lfms", delay*1000);
 	return MIN_FAIL_DELAY_SECONDS + delay;
 }
 
@@ -243,6 +247,12 @@ ensure_minimum_time_since(double start, double seconds)
 {
 	struct timespec ts;
 	double elapsed = monotime_double() - start, req = seconds, remain;
+
+	if (elapsed > MAX_FAIL_DELAY_SECONDS) {
+		debug3_f("elapsed %0.3lfms exceeded the max delay "
+		    "requested %0.3lfms)", elapsed*1000, req*1000);
+		return;
+	}
 
 	/* if we've already passed the requested time, scale up */
 	while ((remain = seconds - elapsed) < 0.0)
@@ -255,9 +265,14 @@ ensure_minimum_time_since(double start, double seconds)
 	nanosleep(&ts, NULL);
 }
 
-/*ARGSUSED*/
+void
+auth_failure_delay(Authctxt *authctxt, double tstart)
+{
+	ensure_minimum_time_since(tstart, user_specific_delay(authctxt->user));
+}
+
 static int
-input_userauth_request(int type, u_int32_t seq, struct ssh *ssh)
+input_userauth_request(int type, uint32_t seq, struct ssh *ssh)
 {
 	Authctxt *authctxt = ssh->authctxt;
 	Authmethod *m = NULL;
@@ -277,34 +292,40 @@ input_userauth_request(int type, u_int32_t seq, struct ssh *ssh)
 
 	if ((style = strchr(user, ':')) != NULL)
 		*style++ = 0;
+	/* An empty style is no style; the monitor treats it the same way. */
+	if (style != NULL && *style == '\0')
+		style = NULL;
 
+	if (authctxt->attempt >= 1024)
+		auth_maxtries_exceeded(ssh);
 	if (authctxt->attempt++ == 0) {
 		/* setup auth context */
-		authctxt->pw = PRIVSEP(getpwnamallow(ssh, user));
+		authctxt->pw = mm_getpwnamallow(ssh, user);
 		authctxt->user = xstrdup(user);
+		authctxt->service = xstrdup(service);
+		authctxt->style = style ? xstrdup(style) : NULL;
 		if (authctxt->pw && strcmp(service, "ssh-connection")==0) {
 			authctxt->valid = 1;
 			debug2_f("setting up authctxt for %s", user);
 		} else {
+			authctxt->valid = 0;
 			/* Invalid user, fake password information */
 			authctxt->pw = fakepw();
 #ifdef SSH_AUDIT_EVENTS
-			PRIVSEP(audit_event(ssh, SSH_INVALID_USER));
+			mm_audit_event(ssh, SSH_INVALID_USER);
 #endif
 		}
 #ifdef USE_PAM
 		if (options.use_pam)
-			PRIVSEP(start_pam(ssh));
+			mm_start_pam(ssh);
 #endif
 		ssh_packet_set_log_preamble(ssh, "%suser %s",
 		    authctxt->valid ? "authenticating " : "invalid ", user);
-		setproctitle("%s%s", authctxt->valid ? user : "unknown",
-		    use_privsep ? " [net]" : "");
-		authctxt->service = xstrdup(service);
-		authctxt->style = style ? xstrdup(style) : NULL;
-		if (use_privsep)
-			mm_inform_authserv(service, style);
+		setproctitle("%s [net]", authctxt->valid ? user : "unknown");
+		mm_inform_authserv(service, style);
 		userauth_banner(ssh);
+		if ((r = kex_server_update_ext_info(ssh)) != 0)
+			fatal_fr(r, "kex_server_update_ext_info failed");
 		if (auth2_setup_methods_lists(authctxt) != 0)
 			ssh_packet_disconnect(ssh,
 			    "no authentication methods enabled");
@@ -318,6 +339,7 @@ input_userauth_request(int type, u_int32_t seq, struct ssh *ssh)
 	auth2_challenge_stop(ssh);
 
 #ifdef GSSAPI
+	ssh_gssapi_cleanup_global_client();
 	/* XXX move to auth2_gssapi_stop() */
 	ssh_dispatch_set(ssh, SSH2_MSG_USERAUTH_GSSAPI_TOKEN, NULL);
 	ssh_dispatch_set(ssh, SSH2_MSG_USERAUTH_GSSAPI_EXCHANGE_COMPLETE, NULL);
@@ -326,16 +348,17 @@ input_userauth_request(int type, u_int32_t seq, struct ssh *ssh)
 	auth2_authctxt_reset_info(authctxt);
 	authctxt->postponed = 0;
 	authctxt->server_caused_failure = 0;
+	authctxt->auth_failure_already_counted = 0;
 
 	/* try to authenticate user */
 	m = authmethod_lookup(authctxt, method);
 	if (m != NULL && authctxt->failures < options.max_authtries) {
 		debug2("input_userauth_request: try method %s", method);
-		authenticated =	m->userauth(ssh);
+		authenticated =	m->userauth(ssh, method);
 	}
-	if (!authctxt->authenticated)
-		ensure_minimum_time_since(tstart,
-		    user_specific_delay(authctxt->user));
+	if (!authctxt->authenticated && strcmp(method, "none") != 0)
+		auth_failure_delay(authctxt, tstart);
+
 	userauth_finish(ssh, authenticated, method, NULL);
 	r = 0;
  out:
@@ -346,25 +369,34 @@ input_userauth_request(int type, u_int32_t seq, struct ssh *ssh)
 }
 
 void
-userauth_finish(struct ssh *ssh, int authenticated, const char *method,
+userauth_finish(struct ssh *ssh, int authenticated, const char *packet_method,
     const char *submethod)
 {
 	Authctxt *authctxt = ssh->authctxt;
+	Authmethod *m = NULL;
+	const char *method = packet_method;
 	char *methods;
 	int r, partial = 0;
 
-	if (!authctxt->valid && authenticated)
-		fatal("INTERNAL ERROR: authenticated invalid user %s",
-		    authctxt->user);
-	if (authenticated && authctxt->postponed)
-		fatal("INTERNAL ERROR: authenticated and postponed");
+	if (authenticated) {
+		if (!authctxt->valid) {
+			fatal("INTERNAL ERROR: authenticated invalid user %s",
+			    authctxt->user);
+		}
+		if (authctxt->postponed)
+			fatal("INTERNAL ERROR: authenticated and postponed");
+		/* prefer primary authmethod name to possible synonym */
+		if ((m = authmethod_byname(method)) == NULL)
+			fatal("INTERNAL ERROR: bad method %s", method);
+		method = m->cfg->name;
+	}
 
 	/* Special handling for root */
 	if (authenticated && authctxt->pw->pw_uid == 0 &&
 	    !auth_root_allowed(ssh, method)) {
 		authenticated = 0;
 #ifdef SSH_AUDIT_EVENTS
-		PRIVSEP(audit_event(ssh, SSH_LOGIN_ROOT_DENIED));
+		mm_audit_event(ssh, SSH_LOGIN_ROOT_DENIED);
 #endif
 	}
 
@@ -387,7 +419,7 @@ userauth_finish(struct ssh *ssh, int authenticated, const char *method,
 
 #ifdef USE_PAM
 	if (options.use_pam && authenticated) {
-		int r, success = PRIVSEP(do_pam_account());
+		int r, success = mm_do_pam_account();
 
 		/* If PAM returned a message, send it to the user. */
 		if (sshbuf_len(loginmsg) > 0) {
@@ -421,11 +453,12 @@ userauth_finish(struct ssh *ssh, int authenticated, const char *method,
 	} else {
 		/* Allow initial try of "none" auth without failure penalty */
 		if (!partial && !authctxt->server_caused_failure &&
+		    !authctxt->auth_failure_already_counted &&
 		    (authctxt->attempt > 1 || strcmp(method, "none") != 0))
 			authctxt->failures++;
 		if (authctxt->failures >= options.max_authtries) {
 #ifdef SSH_AUDIT_EVENTS
-			PRIVSEP(audit_event(ssh, SSH_LOGIN_EXCEED_MAXTRIES));
+			mm_audit_event(ssh, SSH_LOGIN_EXCEED_MAXTRIES);
 #endif
 			auth_maxtries_exceeded(ssh);
 		}
@@ -477,16 +510,16 @@ authmethods_get(Authctxt *authctxt)
 	if ((b = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
 	for (i = 0; authmethods[i] != NULL; i++) {
-		if (strcmp(authmethods[i]->name, "none") == 0)
+		if (strcmp(authmethods[i]->cfg->name, "none") == 0)
 			continue;
-		if (authmethods[i]->enabled == NULL ||
-		    *(authmethods[i]->enabled) == 0)
+		if (authmethods[i]->cfg->enabled == NULL ||
+		    *(authmethods[i]->cfg->enabled) == 0)
 			continue;
-		if (!auth2_method_allowed(authctxt, authmethods[i]->name,
+		if (!auth2_method_allowed(authctxt, authmethods[i]->cfg->name,
 		    NULL))
 			continue;
 		if ((r = sshbuf_putf(b, "%s%s", sshbuf_len(b) ? "," : "",
-		    authmethods[i]->name)) != 0)
+		    authmethods[i]->cfg->name)) != 0)
 			fatal_fr(r, "buffer error");
 	}
 	if ((list = sshbuf_dup_string(b)) == NULL)
@@ -496,68 +529,40 @@ authmethods_get(Authctxt *authctxt)
 }
 
 static Authmethod *
-authmethod_lookup(Authctxt *authctxt, const char *name)
+authmethod_byname(const char *name)
 {
 	int i;
 
-	if (name != NULL)
-		for (i = 0; authmethods[i] != NULL; i++)
-			if (authmethods[i]->enabled != NULL &&
-			    *(authmethods[i]->enabled) != 0 &&
-			    strcmp(name, authmethods[i]->name) == 0 &&
-			    auth2_method_allowed(authctxt,
-			    authmethods[i]->name, NULL))
-				return authmethods[i];
-	debug2("Unrecognized authentication method name: %s",
-	    name ? name : "NULL");
+	if (name == NULL)
+		fatal_f("NULL authentication method name");
+	for (i = 0; authmethods[i] != NULL; i++) {
+		if (strcmp(name, authmethods[i]->cfg->name) == 0 ||
+		    (authmethods[i]->cfg->synonym != NULL &&
+		    strcmp(name, authmethods[i]->cfg->synonym) == 0))
+			return authmethods[i];
+	}
+	debug_f("unrecognized authentication method name: %s", name);
 	return NULL;
 }
 
-/*
- * Check a comma-separated list of methods for validity. Is need_enable is
- * non-zero, then also require that the methods are enabled.
- * Returns 0 on success or -1 if the methods list is invalid.
- */
-int
-auth2_methods_valid(const char *_methods, int need_enable)
+static Authmethod *
+authmethod_lookup(Authctxt *authctxt, const char *name)
 {
-	char *methods, *omethods, *method, *p;
-	u_int i, found;
-	int ret = -1;
+	Authmethod *method;
 
-	if (*_methods == '\0') {
-		error("empty authentication method list");
-		return -1;
+	if ((method = authmethod_byname(name)) == NULL)
+		return NULL;
+
+	if (method->cfg->enabled == NULL || *(method->cfg->enabled) == 0) {
+		debug3_f("method %s not enabled", name);
+		return NULL;
 	}
-	omethods = methods = xstrdup(_methods);
-	while ((method = strsep(&methods, ",")) != NULL) {
-		for (found = i = 0; !found && authmethods[i] != NULL; i++) {
-			if ((p = strchr(method, ':')) != NULL)
-				*p = '\0';
-			if (strcmp(method, authmethods[i]->name) != 0)
-				continue;
-			if (need_enable) {
-				if (authmethods[i]->enabled == NULL ||
-				    *(authmethods[i]->enabled) == 0) {
-					error("Disabled method \"%s\" in "
-					    "AuthenticationMethods list \"%s\"",
-					    method, _methods);
-					goto out;
-				}
-			}
-			found = 1;
-			break;
-		}
-		if (!found) {
-			error("Unknown authentication method \"%s\" in list",
-			    method);
-			goto out;
-		}
+	if (!auth2_method_allowed(authctxt, method->cfg->name, NULL)) {
+		debug3_f("method %s not allowed "
+		    "by AuthenticationMethods", name);
+		return NULL;
 	}
-	ret = 0;
- out:
-	free(omethods);
-	return ret;
+	return method;
 }
 
 /*

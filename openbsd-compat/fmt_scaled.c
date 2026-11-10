@@ -1,4 +1,4 @@
-/*	$OpenBSD: fmt_scaled.c,v 1.17 2018/05/14 04:39:04 djm Exp $	*/
+/*	$OpenBSD: fmt_scaled.c,v 1.25 2026/06/06 23:53:59 djm Exp $	*/
 
 /*
  * Copyright (c) 2001, 2002, 2003 Ian F. Darwin.  All rights reserved.
@@ -54,9 +54,9 @@ typedef enum {
 } unit_type;
 
 /* These three arrays MUST be in sync!  XXX make a struct */
-static unit_type units[] = { NONE, KILO, MEGA, GIGA, TERA, PETA, EXA };
-static char scale_chars[] = "BKMGTPE";
-static long long scale_factors[] = {
+static const unit_type units[] = { NONE, KILO, MEGA, GIGA, TERA, PETA, EXA };
+static const char scale_chars[] = "BKMGTPE";
+static const long long scale_factors[] = {
 	1LL,
 	1024LL,
 	1024LL*1024,
@@ -77,7 +77,7 @@ scan_scaled(char *scaled, long long *result)
 {
 	char *p = scaled;
 	int sign = 0;
-	unsigned int i, ndigits = 0, fract_digits = 0;
+	unsigned int i, ndigits = 0, fract_digits = 0, muls = 0, divs = 0;
 	long long scale_fact = 1, whole = 0, fpart = 0;
 
 	/* Skip leading whitespace */
@@ -153,10 +153,8 @@ scan_scaled(char *scaled, long long *result)
 		}
 	}
 
-	if (sign) {
+	if (sign)
 		whole *= sign;
-		fpart *= sign;
-	}
 
 	/* If no scale factor given, we're done. fraction is discarded. */
 	if (!*p) {
@@ -188,19 +186,38 @@ scan_scaled(char *scaled, long long *result)
 			/* scale whole part */
 			whole *= scale_fact;
 
-			/* truncate fpart so it doesn't overflow.
-			 * then scale fractional part.
+			/*
+			 * Scale fractional part: compute
+			 *   fpart * scale_fact / 10^(fract_digits-1)
+			 * without intermediate overflow. scale_fact is 1024^i,
+			 * i.e. a power of 1024 = 2^10. Interleave
+			 * multiply-by-1024 with divide-by-10 so the running
+			 * value stays within long long range while preserving
+			 * precision.
 			 */
-			while (fpart >= LLONG_MAX / scale_fact) {
-				fpart /= 10;
-				fract_digits--;
-			}
-			fpart *= scale_fact;
-			if (fract_digits > 0) {
-				for (i = 0; i < fract_digits -1; i++)
+			muls = i;
+			divs = fract_digits > 0 ?  fract_digits - 1 : 0;
+			while (muls > 0 && divs > 0) {
+				if (fpart <= LLONG_MAX / 1024) {
+					fpart *= 1024;
+					muls--;
+				} else {
 					fpart /= 10;
+					divs--;
+				}
 			}
-			whole += fpart;
+			while (muls > 0) {
+				fpart *= 1024;
+				muls--;
+			}
+			while (divs > 0) {
+				fpart /= 10;
+				divs--;
+			}
+			if (sign == -1)
+				whole -= fpart;
+			else
+				whole += fpart;
 			*result = whole;
 			return 0;
 		}
@@ -222,12 +239,16 @@ fmt_scaled(long long number, char *result)
 	unsigned int i;
 	unit_type unit = NONE;
 
+	/* Not every negative long long has a positive representation. */
+	if (number == LLONG_MIN) {
+		errno = ERANGE;
+		return -1;
+	}
+
 	abval = llabs(number);
 
-	/* Not every negative long long has a positive representation.
-	 * Also check for numbers that are just too darned big to format
-	 */
-	if (abval < 0 || abval / 1024 >= scale_factors[SCALE_LENGTH-1]) {
+	/* Also check for numbers that are just too darned big to format. */
+	if (abval / 1024 >= scale_factors[SCALE_LENGTH-1]) {
 		errno = ERANGE;
 		return -1;
 	}

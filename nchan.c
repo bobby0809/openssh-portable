@@ -1,4 +1,4 @@
-/* $OpenBSD: nchan.c,v 1.72 2021/01/27 09:26:54 djm Exp $ */
+/* $OpenBSD: nchan.c,v 1.77 2026/02/14 00:18:34 jsg Exp $ */
 /*
  * Copyright (c) 1999, 2000, 2001, 2002 Markus Friedl.  All rights reserved.
  *
@@ -32,10 +32,8 @@
 #include <string.h>
 #include <stdarg.h>
 
-#include "openbsd-compat/sys-queue.h"
 #include "ssh2.h"
 #include "sshbuf.h"
-#include "ssherr.h"
 #include "packet.h"
 #include "channels.h"
 #include "compat.h"
@@ -82,8 +80,12 @@ static void	chan_shutdown_write(struct ssh *, Channel *);
 static void	chan_shutdown_read(struct ssh *, Channel *);
 static void	chan_shutdown_extended_read(struct ssh *, Channel *);
 
-static const char *ostates[] = { "open", "drain", "wait_ieof", "closed" };
-static const char *istates[] = { "open", "drain", "wait_oclose", "closed" };
+static const char * const ostates[] = {
+	"open", "drain", "wait_ieof", "closed",
+};
+static const char * const istates[] = {
+	"open", "drain", "wait_oclose", "closed",
+};
 
 static void
 chan_set_istate(Channel *c, u_int next)
@@ -204,7 +206,7 @@ chan_send_close2(struct ssh *ssh, Channel *c)
 {
 	int r;
 
-	debug2("channel %d: send close", c->self);
+	debug2("channel %d: send_close2", c->self);
 	if (c->ostate != CHAN_OUTPUT_CLOSED ||
 	    c->istate != CHAN_INPUT_CLOSED) {
 		error("channel %d: cannot send close for istate/ostate %d/%d",
@@ -214,6 +216,8 @@ chan_send_close2(struct ssh *ssh, Channel *c)
 	} else {
 		if (!c->have_remote_id)
 			fatal_f("channel %d: no remote_id", c->self);
+		debug2("channel %d: send close for remote id %u", c->self,
+		    c->remote_id);
 		if ((r = sshpkt_start(ssh, SSH2_MSG_CHANNEL_CLOSE)) != 0 ||
 		    (r = sshpkt_put_u32(ssh, c->remote_id)) != 0 ||
 		    (r = sshpkt_send(ssh)) != 0)
@@ -345,7 +349,7 @@ chan_is_dead(struct ssh *ssh, Channel *c, int do_send)
 	if (c->flags & CHAN_LOCAL) {
 		debug2("channel %d: is dead (local)", c->self);
 		return 1;
-	}		
+	}
 	if (!(c->flags & CHAN_CLOSE_SENT)) {
 		if (do_send) {
 			chan_send_close2(ssh, c);
@@ -384,7 +388,7 @@ chan_shutdown_write(struct ssh *ssh, Channel *c)
 			    c->istate, c->ostate, strerror(errno));
 		}
 	} else {
-		if (channel_close_fd(ssh, &c->wfd) < 0) {
+		if (channel_close_fd(ssh, c, &c->wfd) < 0) {
 			logit_f("channel %d: close() failed for "
 			    "fd %d [i%d o%d]: %.100s", c->self, c->wfd,
 			    c->istate, c->ostate, strerror(errno));
@@ -412,7 +416,7 @@ chan_shutdown_read(struct ssh *ssh, Channel *c)
 			    c->istate, c->ostate, strerror(errno));
 		}
 	} else {
-		if (channel_close_fd(ssh, &c->rfd) < 0) {
+		if (channel_close_fd(ssh, c, &c->rfd) < 0) {
 			logit_f("channel %d: close() failed for "
 			    "fd %d [i%d o%d]: %.100s", c->self, c->rfd,
 			    c->istate, c->ostate, strerror(errno));
@@ -431,7 +435,7 @@ chan_shutdown_extended_read(struct ssh *ssh, Channel *c)
 	debug_f("channel %d: (i%d o%d sock %d wfd %d efd %d [%s])",
 	    c->self, c->istate, c->ostate, c->sock, c->rfd, c->efd,
 	    channel_format_extended_usage(c));
-	if (channel_close_fd(ssh, &c->efd) < 0) {
+	if (channel_close_fd(ssh, c, &c->efd) < 0) {
 		logit_f("channel %d: close() failed for "
 		    "extended fd %d [i%d o%d]: %.100s", c->self, c->efd,
 		    c->istate, c->ostate, strerror(errno));

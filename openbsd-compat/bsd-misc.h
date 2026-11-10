@@ -20,6 +20,7 @@
 #include "includes.h"
 
 char *ssh_get_progname(char *);
+int seed_from_prngd(unsigned char *, size_t);
 
 #ifndef HAVE_SETSID
 #define setsid() setpgrp(0, getpid())
@@ -61,8 +62,12 @@ struct timeval {
 }
 #endif /* HAVE_STRUCT_TIMEVAL */
 
-int utimes(char *, struct timeval *);
+int utimes(const char *, struct timeval *);
 #endif /* HAVE_UTIMES */
+
+#ifndef HAVE_DIRFD
+int dirfd(void *);
+#endif
 
 #ifndef AT_FDCWD
 # define AT_FDCWD (-2)
@@ -74,6 +79,14 @@ int fchmodat(int, const char *, mode_t, int);
 
 #ifndef HAVE_FCHOWNAT
 int fchownat(int, const char *, uid_t, gid_t, int);
+#endif
+
+#ifdef HAVE_FSTATAT
+int fstatat(int, const char *, struct stat *, int);
+#endif
+
+#ifdef HAVE_UNLINKAT
+int unlinkat(int, const char *, int);
 #endif
 
 #ifndef HAVE_TRUNCATE
@@ -125,6 +138,11 @@ int	isblank(int);
 pid_t getpgid(pid_t);
 #endif
 
+#ifndef HAVE_PSELECT
+int pselect(int, fd_set *, fd_set *, fd_set *, const struct timespec *,
+    const sigset_t *);
+#endif
+
 #ifndef HAVE_ENDGRENT
 # define endgrent() do { } while(0)
 #endif
@@ -138,7 +156,11 @@ pid_t getpgid(pid_t);
 #endif
 
 #ifndef HAVE_PLEDGE
-int pledge(const char *promises, const char *paths[]);
+int pledge(const char *promises, const char *execpromises);
+#endif
+
+#ifndef HAVE_UNVEIL
+int unveil(const char *, const char *);
 #endif
 
 /* bsd-err.h */
@@ -182,6 +204,14 @@ int flock(int, int);
 
 #ifndef HAVE_LOCALTIME_R
 struct tm *localtime_r(const time_t *, struct tm *);
+#endif
+
+#ifndef HAVE_CLOCK_GETTIME
+typedef int clockid_t;
+#ifndef CLOCK_REALTIME
+# define CLOCK_REALTIME	0
+#endif
+int clock_gettime(clockid_t, struct timespec *);
 #endif
 
 #ifndef HAVE_REALPATH

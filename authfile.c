@@ -1,4 +1,4 @@
-/* $OpenBSD: authfile.c,v 1.141 2020/06/18 23:33:38 djm Exp $ */
+/* $OpenBSD: authfile.c,v 1.152 2026/07/07 04:04:16 djm Exp $ */
 /*
  * Copyright (c) 2000, 2013 Markus Friedl.  All rights reserved.
  *
@@ -27,7 +27,6 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/uio.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -36,20 +35,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <limits.h>
 
-#include "cipher.h"
-#include "ssh.h"
 #include "log.h"
 #include "authfile.h"
-#include "misc.h"
-#include "atomicio.h"
 #include "sshkey.h"
 #include "sshbuf.h"
 #include "ssherr.h"
 #include "krl.h"
-
-#define MAX_KEY_FILE_SIZE	(1024 * 1024)
 
 /* Save a key blob to a file */
 static int
@@ -133,8 +125,6 @@ sshkey_load_private_type(int type, const char *filename, const char *passphrase,
 		goto out;
 
 	r = sshkey_load_private_type_fd(fd, type, passphrase, keyp, commentp);
-	if (r == 0 && keyp && *keyp)
-		r = sshkey_set_filename(*keyp, filename);
  out:
 	close(fd);
 	return r;
@@ -186,8 +176,6 @@ sshkey_load_pubkey_from_private(const char *filename, struct sshkey **pubkeyp)
 	    (r = sshkey_parse_pubkey_from_private_fileblob_type(buffer,
 	    KEY_UNSPEC, &pubkey)) != 0)
 		goto out;
-	if ((r = sshkey_set_filename(pubkey, filename)) != 0)
-		goto out;
 	/* success */
 	if (pubkeyp != NULL) {
 		*pubkeyp = pubkey;
@@ -209,13 +197,21 @@ sshkey_try_load_public(struct sshkey **kp, const char *filename,
 	char *line = NULL, *cp;
 	size_t linesize = 0;
 	int r;
+	struct stat st;
 	struct sshkey *k = NULL;
 
+	if (kp == NULL)
+		return SSH_ERR_INVALID_ARGUMENT;
 	*kp = NULL;
 	if (commentp != NULL)
 		*commentp = NULL;
 	if ((f = fopen(filename, "r")) == NULL)
 		return SSH_ERR_SYSTEM_ERROR;
+	if (fstat(fileno(f), &st) == 0 && S_ISREG(st.st_mode) &&
+	    st.st_size > SSHBUF_SIZE_MAX) {
+		fclose(f);
+		return SSH_ERR_INVALID_FORMAT;
+	}
 	if ((k = sshkey_new(KEY_UNSPEC)) == NULL) {
 		fclose(f);
 		return SSH_ERR_ALLOC_FAIL;
@@ -328,11 +324,10 @@ sshkey_load_private_cert(int type, const char *filename, const char *passphrase,
 	switch (type) {
 #ifdef WITH_OPENSSL
 	case KEY_RSA:
-	case KEY_DSA:
 	case KEY_ECDSA:
 #endif /* WITH_OPENSSL */
 	case KEY_ED25519:
-	case KEY_XMSS:
+	case KEY_MLDSA44_ED25519:
 	case KEY_UNSPEC:
 		break;
 	default:
@@ -368,7 +363,7 @@ sshkey_load_private_cert(int type, const char *filename, const char *passphrase,
  * Returns success if the specified "key" is listed in the file "filename",
  * SSH_ERR_KEY_NOT_FOUND: if the key is not listed or another error.
  * If "strict_type" is set then the key type must match exactly,
- * otherwise a comparison that ignores certficiate data is performed.
+ * otherwise a comparison that ignores certificate data is performed.
  * If "check_ca" is set and "key" is a certificate, then its CA key is
  * also checked and sshkey_in_file() will return success if either is found.
  */
@@ -501,20 +496,25 @@ sshkey_save_public(const struct sshkey *key, const char *path,
 		return SSH_ERR_SYSTEM_ERROR;
 	if ((f = fdopen(fd, "w")) == NULL) {
 		r = SSH_ERR_SYSTEM_ERROR;
+		close(fd);
 		goto fail;
 	}
 	if ((r = sshkey_write(key, f)) != 0)
 		goto fail;
 	fprintf(f, " %s\n", comment);
-	if (ferror(f) || fclose(f) != 0) {
+	if (ferror(f)) {
 		r = SSH_ERR_SYSTEM_ERROR;
+		goto fail;
+	}
+	if (fclose(f) != 0) {
+		r = SSH_ERR_SYSTEM_ERROR;
+		f = NULL;
  fail:
-		oerrno = errno;
-		if (f != NULL)
+		if (f != NULL) {
+			oerrno = errno;
 			fclose(f);
-		else
-			close(fd);
-		errno = oerrno;
+			errno = oerrno;
+		}
 		return r;
 	}
 	return 0;

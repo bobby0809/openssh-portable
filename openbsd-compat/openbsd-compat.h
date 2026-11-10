@@ -43,12 +43,21 @@
 #include "vis.h"
 #include "getrrsetbyname.h"
 #include "sha1.h"
-#include "sha2.h"
+#include "bsd-sha2.h"
 #include "md5.h"
 #include "blf.h"
 #include "fnmatch.h"
 
+#ifndef __THROW
+# if defined __cplusplus
+#  define __THROW throw()
+# else
+#  define __THROW
+# endif
+#endif
+
 #if defined(HAVE_LOGIN_CAP) && !defined(HAVE_LOGIN_GETPWCLASS)
+# include <login_cap.h>
 # define login_getpwclass(pw) login_getclass(pw->pw_class)
 #endif
 
@@ -64,6 +73,10 @@ int bindresvport_sa(int sd, struct sockaddr *sa);
 void closefrom(int);
 #endif
 
+#if defined(HAVE_DECL_FTRUNCATE) && HAVE_DECL_FTRUNCATE == 0
+int ftruncate(int filedes, off_t length);
+#endif
+
 #ifndef HAVE_GETLINE
 #include <stdio.h>
 ssize_t getline(char **, size_t *, FILE *);
@@ -75,6 +88,15 @@ int getpagesize(void);
 
 #ifndef HAVE_GETCWD
 char *getcwd(char *pt, size_t size);
+#endif
+
+#ifndef HAVE_GETEXECPATH
+/* XXX this relies on correct fallback behaviour */
+#define getexecpath(a, b) (-1)
+#endif
+
+#ifndef HAVE_KILLPG
+int killpg(pid_t, int);
 #endif
 
 #if defined(HAVE_DECL_MEMMEM) && HAVE_DECL_MEMMEM == 0
@@ -132,6 +154,9 @@ int mkstemp(char *path);
 char *mkdtemp(char *path);
 #endif
 
+#define mkstemp(x) _ssh_mkstemp(x)
+int _ssh_mkstemp(char *);
+
 #ifndef HAVE_DAEMON
 int daemon(int nochdir, int noclose);
 #endif
@@ -175,7 +200,7 @@ int getgrouplist(const char *, gid_t, gid_t *, int *);
 #endif
 
 #if !defined(HAVE_GETOPT) || !defined(HAVE_GETOPT_OPTRESET)
-int BSDgetopt(int argc, char * const *argv, const char *opts);
+int BSDgetopt(int argc, char * const *argv, const char *opts) __THROW;
 #include "openbsd-compat/getopt.h"
 #endif
 
@@ -194,9 +219,9 @@ int writev(int, struct iovec *, int);
 #endif
 
 /* Home grown routines */
+#include "bsd-signal.h"
 #include "bsd-misc.h"
 #include "bsd-setres_id.h"
-#include "bsd-signal.h"
 #include "bsd-statvfs.h"
 #include "bsd-waitpid.h"
 #include "bsd-poll.h"
@@ -205,21 +230,20 @@ int writev(int, struct iovec *, int);
 int getpeereid(int , uid_t *, gid_t *);
 #endif
 
-#ifdef HAVE_ARC4RANDOM
-# ifndef HAVE_ARC4RANDOM_STIR
-#  define arc4random_stir()
-# endif
-#else
-unsigned int arc4random(void);
-void arc4random_stir(void);
+#ifndef HAVE_ARC4RANDOM
+uint32_t arc4random(void);
 #endif /* !HAVE_ARC4RANDOM */
 
 #ifndef HAVE_ARC4RANDOM_BUF
 void arc4random_buf(void *, size_t);
 #endif
 
+#ifndef HAVE_ARC4RANDOM_STIR
+# define arc4random_stir()
+#endif
+
 #ifndef HAVE_ARC4RANDOM_UNIFORM
-u_int32_t arc4random_uniform(u_int32_t);
+uint32_t arc4random_uniform(uint32_t);
 #endif
 
 #ifndef HAVE_ASPRINTF
@@ -228,7 +252,8 @@ int asprintf(char **, const char *, ...);
 
 #ifndef HAVE_OPENPTY
 # include <sys/ioctl.h>	/* for struct winsize */
-int openpty(int *, int *, char *, struct termios *, struct winsize *);
+int openpty(int *, int *, char *, const struct termios *,
+    const struct winsize *);
 #endif /* HAVE_OPENPTY */
 
 #ifndef HAVE_SNPRINTF
@@ -314,8 +339,8 @@ int timingsafe_bcmp(const void *, const void *, size_t);
 #endif
 
 #ifndef HAVE_BCRYPT_PBKDF
-int	bcrypt_pbkdf(const char *, size_t, const u_int8_t *, size_t,
-    u_int8_t *, size_t, unsigned int);
+int	bcrypt_pbkdf(const char *, size_t, const uint8_t *, size_t,
+    uint8_t *, size_t, unsigned int);
 #endif
 
 #ifndef HAVE_EXPLICIT_BZERO
@@ -328,6 +353,11 @@ void freezero(void *, size_t);
 
 #ifndef HAVE_LOCALTIME_R
 struct tm *localtime_r(const time_t *, struct tm *);
+#endif
+
+#ifndef HAVE_TIMEGM
+#include <time.h>
+time_t timegm(struct tm *);
 #endif
 
 char *xcrypt(const char *password, const char *salt);

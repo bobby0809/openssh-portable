@@ -27,26 +27,40 @@
 
 /* OPENBSD ORIGINAL: sys/sys/poll.h */
 
-#if !defined(HAVE_POLL) && !defined(HAVE_POLL_H)
 #ifndef	_COMPAT_POLL_H_
 #define	_COMPAT_POLL_H_
 
+#include <sys/types.h>
+#include <poll.h>
+
+#ifndef HAVE_STRUCT_POLLFD_FD
 typedef struct pollfd {
 	int	fd;
 	short	events;
 	short	revents;
 } pollfd_t;
 
-typedef unsigned int	nfds_t;
+#ifndef POLLIN
+# define POLLIN		0x0001
+#endif
+#ifndef POLLPRI
+# define POLLPRI	0x0002
+#endif
+#ifndef POLLOUT
+# define POLLOUT	0x0004
+#endif
+#ifndef POLLERR
+# define POLLERR	0x0008
+#endif
+#ifndef POLLHUP
+# define POLLHUP	0x0010
+#endif
+#ifndef POLLNVAL
+# define POLLNVAL	0x0020
+#endif
 
-#define	POLLIN		0x0001
-#define	POLLOUT		0x0004
-#define	POLLERR		0x0008
-#define	POLLHUP		0x0010
-#define	POLLNVAL	0x0020
 #if 0
 /* the following are currently not implemented */
-#define	POLLPRI		0x0002
 #define	POLLRDNORM	0x0040
 #define POLLNORM	POLLRDNORM
 #define POLLWRNORM      POLLOUT
@@ -55,7 +69,22 @@ typedef unsigned int	nfds_t;
 #endif
 
 #define INFTIM		(-1)	/* not standard */
+#endif /* !HAVE_STRUCT_POLLFD_FD */
 
+#ifndef HAVE_NFDS_T
+# ifdef POLL_NFDS_T_ULONG
+typedef unsigned long	nfds_t;
+# else
+typedef unsigned int	nfds_t;
+# endif
+#endif
+
+#ifndef HAVE_POLL
 int   poll(struct pollfd *, nfds_t, int);
+#endif
+
+#ifndef HAVE_PPOLL
+int   ppoll(struct pollfd *, nfds_t, const struct timespec *, const sigset_t *);
+#endif
+
 #endif /* !_COMPAT_POLL_H_ */
-#endif /* !HAVE_POLL_H */

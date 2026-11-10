@@ -1,4 +1,4 @@
-/*	$OpenBSD: sftp-realpath.c,v 1.1 2019/07/05 04:55:40 djm Exp $ */
+/*	$OpenBSD: sftp-realpath.c,v 1.3 2026/10/29 04:41:59 djm Exp $ */
 /*
  * Copyright (c) 2003 Constantin S. Svintsoff <kostik@iclub.nsu.ru>
  *
@@ -30,7 +30,6 @@
 #include "includes.h"
 
 #include <sys/types.h>
-#include <sys/param.h>
 #include <sys/stat.h>
 
 #include <errno.h>
@@ -174,6 +173,11 @@ sftp_realpath(const char *path, char *resolved)
 			slen = readlink(resolved, symlink, sizeof(symlink) - 1);
 			if (slen < 0)
 				goto err;
+			if (slen == 0) {
+				/* refuse empty links */
+				errno = ENOENT;
+				goto err;
+			}
 			symlink[slen] = '\0';
 			if (symlink[0] == '/') {
 				resolved[1] = 0;

@@ -1,14 +1,7 @@
-#	$OpenBSD: sshcfgparse.sh,v 1.7 2021/02/24 23:12:35 dtucker Exp $
+#	$OpenBSD: sshcfgparse.sh,v 1.12 2026/10/30 08:12:58 djm Exp $
 #	Placed in the Public Domain.
 
 tid="ssh config parse"
-
-dsa=0
-for t in $SSH_KEYTYPES; do
-	case "$t" in
-		ssh-dss)	dsa=1 ;;
-	esac
-done
 
 expect_result_present() {
 	_str="$1" ; shift
@@ -32,7 +25,7 @@ expect_result_absent() {
 verbose "reparse minimal config"
 (${SSH} -G -F $OBJ/ssh_config somehost >$OBJ/ssh_config.1 &&
  ${SSH} -G -F $OBJ/ssh_config.1 somehost >$OBJ/ssh_config.2 &&
- diff $OBJ/ssh_config.1 $OBJ/ssh_config.2) || fail "reparse minimal config"
+ diff $OBJ/ssh_config.1 $OBJ/ssh_config.2) || fail "failed to reparse minimal"
 
 verbose "ssh -W opts"
 f=`${SSH} -GF $OBJ/ssh_config host | awk '/exitonforwardfailure/{print $2}'`
@@ -66,33 +59,26 @@ verbose "pubkeyacceptedalgorithms"
 # Default set
 f=`${SSH} -GF none host | awk '/^pubkeyacceptedalgorithms /{print $2}'`
 expect_result_present "$f" "ssh-ed25519" "ssh-ed25519-cert-v01.*"
-expect_result_absent "$f" "ssh-dss"
 # Explicit override
 f=`${SSH} -GF none -opubkeyacceptedalgorithms=ssh-ed25519 host | \
     awk '/^pubkeyacceptedalgorithms /{print $2}'`
 expect_result_present "$f" "ssh-ed25519"
-expect_result_absent "$f" "ssh-ed25519-cert-v01.*" "ssh-dss"
+expect_result_absent "$f" "ssh-ed25519-cert-v01.*"
 # Removal from default set
 f=`${SSH} -GF none -opubkeyacceptedalgorithms=-ssh-ed25519-cert* host | \
     awk '/^pubkeyacceptedalgorithms /{print $2}'`
 expect_result_present "$f" "ssh-ed25519"
-expect_result_absent "$f" "ssh-ed25519-cert-v01.*" "ssh-dss"
+expect_result_absent "$f" "ssh-ed25519-cert-v01.*"
 f=`${SSH} -GF none -opubkeyacceptedalgorithms=-ssh-ed25519 host | \
     awk '/^pubkeyacceptedalgorithms /{print $2}'`
 expect_result_present "$f" "ssh-ed25519-cert-v01.*"
-expect_result_absent "$f" "ssh-ed25519" "ssh-dss"
+expect_result_absent "$f" "ssh-ed25519"
+# Removal of the entire default set is an error.
+${SSH} -GF none '-opubkeyacceptedalgorithms=-*' host >/dev/null 2>&1 && \
+	fail "pubkeyacceptedalgorithms empty after removal accepted"
 # Append to default set.
 # This is not tested when built !WITH_OPENSSL
-if [ "$dsa" = "1" ]; then
-	f=`${SSH} -GF none -opubkeyacceptedalgorithms=+ssh-dss-cert* host | \
-	    awk '/^pubkeyacceptedalgorithms /{print $2}'`
-	expect_result_present "$f" "ssh-ed25519" "ssh-dss-cert-v01.*"
-	expect_result_absent "$f" "ssh-dss"
-	f=`${SSH} -GF none -opubkeyacceptedalgorithms=+ssh-dss host | \
-	    awk '/^pubkeyacceptedalgorithms /{print $2}'`
-	expect_result_present "$f" "ssh-ed25519" "ssh-ed25519-cert-v01.*" "ssh-dss"
-	expect_result_absent "$f" "ssh-dss-cert-v01.*"
-fi
+# XXX need a test for this
 
 verbose "agentforwarding"
 f=`${SSH} -GF none host | awk '/^forwardagent /{print$2}'`
@@ -103,6 +89,33 @@ f=`${SSH} -GF none -oforwardagent=yes host | awk '/^forwardagent /{print$2}'`
 expect_result_present "$f" "yes"
 f=`${SSH} -GF none '-oforwardagent=SSH_AUTH_SOCK.forward' host | awk '/^forwardagent /{print$2}'`
 expect_result_present "$f" "SSH_AUTH_SOCK.forward"
+
+verbose "command line override"
+cat >$OBJ/ssh_config.0 <<EOD
+Host *
+    IPQoS af21 cs1
+    TunnelDevice 1:2
+EOD
+f=`${SSH} -GF $OBJ/ssh_config.0 -oipqos=cs1 host | awk '/^ipqos /{print$2}'`
+expect_result_present "$f" "cs1"
+f=`${SSH} -GF $OBJ/ssh_config.0 -otunneldevice=3:4 host | awk '/^tunneldevice /{print$2}'`
+expect_result_present "$f" "3:4"
+
+verbose "forkafterauthentication implies stdinnull"
+f=`${SSH} -GF none host | awk '/^stdinnull /{print$2}'`
+expect_result_present "$f" "no"
+f=`${SSH} -GF none -f host true | awk '/^stdinnull /{print$2}'`
+expect_result_present "$f" "yes"
+f=`${SSH} -GF none -oforkafterauthentication=yes host true | awk '/^stdinnull /{print$2}'`
+expect_result_present "$f" "yes"
+f=`${SSH} -GF none -oforkafterauthentication=no host | awk '/^stdinnull /{print$2}'`
+expect_result_present "$f" "no"
+cat >$OBJ/ssh_config.0 <<EOD
+Host *
+    ForkAfterAuthentication yes
+EOD
+f=`${SSH} -GF $OBJ/ssh_config.0 host true | awk '/^stdinnull /{print$2}'`
+expect_result_present "$f" "yes"
 
 # cleanup
 rm -f $OBJ/ssh_config.[012]

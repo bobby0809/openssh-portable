@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh-sk-client.c,v 1.9 2021/04/03 06:18:41 djm Exp $ */
+/* $OpenBSD: ssh-sk-client.c,v 1.18 2026/03/11 09:10:59 dtucker Exp $ */
 /*
  * Copyright (c) 2019 Google LLC
  *
@@ -21,7 +21,6 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 
-#include <fcntl.h>
 #include <limits.h>
 #include <errno.h>
 #include <signal.h>
@@ -30,13 +29,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include "log.h"
 #include "ssherr.h"
 #include "sshbuf.h"
 #include "sshkey.h"
 #include "msg.h"
-#include "digest.h"
 #include "pathnames.h"
 #include "ssh-sk.h"
 #include "misc.h"
@@ -47,9 +46,10 @@ static int
 start_helper(int *fdp, pid_t *pidp, void (**osigchldp)(int))
 {
 	void (*osigchld)(int);
-	int oerrno, pair[2];
+	int oerrno, pair[2], execpipe[2];
+	ssize_t n;
 	pid_t pid;
-	char *helper, *verbosity = NULL;
+	char execbuf[100], *helper, *verbosity = NULL;
 
 	*fdp = -1;
 	*pidp = 0;
@@ -58,19 +58,20 @@ start_helper(int *fdp, pid_t *pidp, void (**osigchldp)(int))
 	helper = getenv("SSH_SK_HELPER");
 	if (helper == NULL || strlen(helper) == 0)
 		helper = _PATH_SSH_SK_HELPER;
-	if (access(helper, X_OK) != 0) {
-		oerrno = errno;
-		error_f("helper \"%s\" unusable: %s", helper, strerror(errno));
-		errno = oerrno;
-		return SSH_ERR_SYSTEM_ERROR;
-	}
 #ifdef DEBUG_SK
 	verbosity = "-vvv";
 #endif
 
+	/* Create a O_CLOEXEC pipe to capture the execve() failure */
+	if (pipe(execpipe) == -1) {
+		error("pipe:  %s", strerror(errno));
+		return SSH_ERR_SYSTEM_ERROR;
+	}
 	/* Start helper */
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == -1) {
 		error("socketpair: %s", strerror(errno));
+		close(execpipe[0]);
+		close(execpipe[1]);
 		return SSH_ERR_SYSTEM_ERROR;
 	}
 	osigchld = ssh_signal(SIGCHLD, SIG_DFL);
@@ -79,14 +80,20 @@ start_helper(int *fdp, pid_t *pidp, void (**osigchldp)(int))
 		error("fork: %s", strerror(errno));
 		close(pair[0]);
 		close(pair[1]);
+		close(execpipe[0]);
+		close(execpipe[1]);
 		ssh_signal(SIGCHLD, osigchld);
 		errno = oerrno;
 		return SSH_ERR_SYSTEM_ERROR;
 	}
 	if (pid == 0) {
+		close(execpipe[0]);
+		FD_CLOSEONEXEC(execpipe[1]);
 		if ((dup2(pair[1], STDIN_FILENO) == -1) ||
 		    (dup2(pair[1], STDOUT_FILENO) == -1)) {
-			error_f("dup2: %s", strerror(errno));
+			snprintf(execbuf, sizeof execbuf,
+			    "dup2: %s", strerror(errno));
+			write(execpipe[1], execbuf, strlen(execbuf)+1);
 			_exit(1);
 		}
 		close(pair[0]);
@@ -95,10 +102,21 @@ start_helper(int *fdp, pid_t *pidp, void (**osigchldp)(int))
 		debug_f("starting %s %s", helper,
 		    verbosity == NULL ? "" : verbosity);
 		execlp(helper, helper, verbosity, (char *)NULL);
-		error_f("execlp: %s", strerror(errno));
+		snprintf(execbuf, sizeof execbuf,
+		    "execlp: %s", strerror(errno));
+		write(execpipe[1], execbuf, strlen(execbuf)+1);
 		_exit(1);
 	}
 	close(pair[1]);
+
+	close(execpipe[1]);
+	n = read(execpipe[0], execbuf, sizeof execbuf);
+	close(execpipe[0]);
+	if (n > 0) {
+		execbuf[n - 1] = '\0';
+		error_f("%s", execbuf);
+		return SSH_ERR_AGENT_FAILURE;
+	}
 
 	/* success */
 	debug3_f("started pid=%ld", (long)pid);
@@ -232,7 +250,6 @@ sshsk_sign(const char *provider, struct sshkey *key,
     u_int compat, const char *pin)
 {
 	int oerrno, r = SSH_ERR_INTERNAL_ERROR;
-	char *fp = NULL;
 	struct sshbuf *kbuf = NULL, *req = NULL, *resp = NULL;
 
 	*sigp = NULL;
@@ -262,12 +279,6 @@ sshsk_sign(const char *provider, struct sshkey *key,
 		goto out;
 	}
 
-	if ((fp = sshkey_fingerprint(key, SSH_FP_HASH_DEFAULT,
-	    SSH_FP_DEFAULT)) == NULL) {
-		error_f("sshkey_fingerprint failed");
-		r = SSH_ERR_ALLOC_FAIL;
-		goto out;
-	}
 	if ((r = client_converse(req, &resp, SSH_SK_HELPER_SIGN)) != 0)
 		goto out;
 
@@ -375,20 +386,46 @@ sshsk_enroll(int type, const char *provider_path, const char *device,
 	return r;
 }
 
+static void
+sshsk_free_resident_key(struct sshsk_resident_key *srk)
+{
+	if (srk == NULL)
+		return;
+	sshkey_free(srk->key);
+	freezero(srk->user_id, srk->user_id_len);
+	free(srk);
+}
+
+
+void
+sshsk_free_resident_keys(struct sshsk_resident_key **srks, size_t nsrks)
+{
+	size_t i;
+
+	if (srks == NULL || nsrks == 0)
+		return;
+
+	for (i = 0; i < nsrks; i++)
+		sshsk_free_resident_key(srks[i]);
+	free(srks);
+}
+
 int
 sshsk_load_resident(const char *provider_path, const char *device,
-    const char *pin, struct sshkey ***keysp, size_t *nkeysp)
+    const char *pin, u_int flags, struct sshsk_resident_key ***srksp,
+    size_t *nsrksp)
 {
 	int oerrno, r = SSH_ERR_INTERNAL_ERROR;
 	struct sshbuf *kbuf = NULL, *req = NULL, *resp = NULL;
-	struct sshkey *key = NULL, **keys = NULL, **tmp;
-	size_t i, nkeys = 0;
+	struct sshkey *key = NULL;
+	struct sshsk_resident_key *srk = NULL, **srks = NULL, **tmp;
+	u_char *userid = NULL;
+	size_t userid_len = 0, nsrks = 0;
 
-	*keysp = NULL;
-	*nkeysp = 0;
+	*srksp = NULL;
+	*nsrksp = 0;
 
-	if ((resp = sshbuf_new()) == NULL ||
-	    (kbuf = sshbuf_new()) == NULL ||
+	if ((kbuf = sshbuf_new()) == NULL ||
 	    (req = sshbuf_new()) == NULL) {
 		r = SSH_ERR_ALLOC_FAIL;
 		goto out;
@@ -396,7 +433,8 @@ sshsk_load_resident(const char *provider_path, const char *device,
 
 	if ((r = sshbuf_put_cstring(req, provider_path)) != 0 ||
 	    (r = sshbuf_put_cstring(req, device)) != 0 ||
-	    (r = sshbuf_put_cstring(req, pin)) != 0) {
+	    (r = sshbuf_put_cstring(req, pin)) != 0 ||
+	    (r = sshbuf_put_u32(req, flags)) != 0) {
 		error_fr(r, "compose");
 		goto out;
 	}
@@ -405,10 +443,11 @@ sshsk_load_resident(const char *provider_path, const char *device,
 		goto out;
 
 	while (sshbuf_len(resp) != 0) {
-		/* key, comment */
+		/* key, comment, user_id */
 		if ((r = sshbuf_get_stringb(resp, kbuf)) != 0 ||
-		    (r = sshbuf_get_cstring(resp, NULL, NULL)) != 0) {
-			error_fr(r, "parse signature");
+		    (r = sshbuf_get_cstring(resp, NULL, NULL)) != 0 ||
+		    (r = sshbuf_get_string(resp, &userid, &userid_len)) != 0) {
+			error_fr(r, "parse");
 			r = SSH_ERR_INVALID_FORMAT;
 			goto out;
 		}
@@ -416,29 +455,42 @@ sshsk_load_resident(const char *provider_path, const char *device,
 			error_fr(r, "decode key");
 			goto out;
 		}
-		if ((tmp = recallocarray(keys, nkeys, nkeys + 1,
-		    sizeof(*keys))) == NULL) {
-			error_f("recallocarray keys failed");
+		if ((srk = calloc(1, sizeof(*srk))) == NULL) {
+			error_f("calloc failed");
+			r = SSH_ERR_ALLOC_FAIL;
 			goto out;
 		}
-		debug_f("keys[%zu]: %s %s", nkeys, sshkey_type(key),
-		    key->sk_application);
-		keys = tmp;
-		keys[nkeys++] = key;
+		srk->key = key;
 		key = NULL;
+		srk->user_id = userid;
+		srk->user_id_len = userid_len;
+		userid = NULL;
+		userid_len = 0;
+		if ((tmp = recallocarray(srks, nsrks, nsrks + 1,
+		    sizeof(*srks))) == NULL) {
+			error_f("recallocarray keys failed");
+			r = SSH_ERR_ALLOC_FAIL;
+			goto out;
+		}
+		debug_f("srks[%zu]: %s %s uidlen %zu", nsrks,
+		    sshkey_type(srk->key), srk->key->sk_application,
+		    srk->user_id_len);
+		srks = tmp;
+		srks[nsrks++] = srk;
+		srk = NULL;
 	}
 
 	/* success */
 	r = 0;
-	*keysp = keys;
-	*nkeysp = nkeys;
-	keys = NULL;
-	nkeys = 0;
+	*srksp = srks;
+	*nsrksp = nsrks;
+	srks = NULL;
+	nsrks = 0;
  out:
 	oerrno = errno;
-	for (i = 0; i < nkeys; i++)
-		sshkey_free(keys[i]);
-	free(keys);
+	sshsk_free_resident_key(srk);
+	sshsk_free_resident_keys(srks, nsrks);
+	freezero(userid, userid_len);
 	sshkey_free(key);
 	sshbuf_free(kbuf);
 	sshbuf_free(req);

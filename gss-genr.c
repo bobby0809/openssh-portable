@@ -1,4 +1,4 @@
-/* $OpenBSD: gss-genr.c,v 1.28 2021/01/27 10:05:28 djm Exp $ */
+/* $OpenBSD: gss-genr.c,v 1.32 2026/10/30 02:15:00 djm Exp $ */
 
 /*
  * Copyright (c) 2001-2007 Simon Wilkinson. All rights reserved.
@@ -34,6 +34,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #include "xmalloc.h"
@@ -146,7 +147,8 @@ ssh_gssapi_last_error(Gssctxt *ctxt, OM_uint32 *major_status,
 
 	if ((r = sshbuf_put_u8(b, '\n')) != 0)
 		fatal_fr(r, "assemble newline");
-	ret = xstrdup((const char *)sshbuf_ptr(b));
+	if ((ret = sshbuf_dup_string(b)) == NULL)
+		fatal_f("sshbuf_dup_string failed");
 	sshbuf_free(b);
 	return (ret);
 }
@@ -277,7 +279,7 @@ ssh_gssapi_check_mechanism(Gssctxt **ctx, gss_OID oid, const char *host)
 	gss_OID_desc spnego_oid = {6, (void *)"\x2B\x06\x01\x05\x05\x02"};
 
 	/* RFC 4462 says we MUST NOT do SPNEGO */
-	if (oid->length == spnego_oid.length && 
+	if (oid->length == spnego_oid.length &&
 	    (memcmp(oid->elements, spnego_oid.elements, oid->length) == 0))
 		return 0; /* false */
 
@@ -285,7 +287,7 @@ ssh_gssapi_check_mechanism(Gssctxt **ctx, gss_OID oid, const char *host)
 	ssh_gssapi_set_oid(*ctx, oid);
 	major = ssh_gssapi_import_name(*ctx, host);
 	if (!GSS_ERROR(major)) {
-		major = ssh_gssapi_init_ctx(*ctx, 0, GSS_C_NO_BUFFER, &token, 
+		major = ssh_gssapi_init_ctx(*ctx, 0, GSS_C_NO_BUFFER, &token,
 		    NULL);
 		gss_release_buffer(&minor, &token);
 		if ((*ctx)->context != GSS_C_NO_CONTEXT)
@@ -293,7 +295,7 @@ ssh_gssapi_check_mechanism(Gssctxt **ctx, gss_OID oid, const char *host)
 			    GSS_C_NO_BUFFER);
 	}
 
-	if (GSS_ERROR(major)) 
+	if (GSS_ERROR(major))
 		ssh_gssapi_delete_ctx(ctx);
 
 	return (!GSS_ERROR(major));

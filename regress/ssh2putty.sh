@@ -1,5 +1,5 @@
 #!/bin/sh
-#	$OpenBSD: ssh2putty.sh,v 1.5 2019/11/21 05:18:47 tb Exp $
+#	$OpenBSD: ssh2putty.sh,v 1.10 2025/05/06 06:05:48 djm Exp $
 
 if test "x$1" = "x" -o "x$2" = "x" -o "x$3" = "x" ; then
 	echo "Usage: ssh2putty hostname port ssh-private-key"
@@ -10,7 +10,8 @@ HOST=$1
 PORT=$2
 KEYFILE=$3
 
-# XXX - support DSA keys too
+OPENSSL_BIN="${OPENSSL_BIN:-openssl}"
+
 if grep "BEGIN RSA PRIVATE KEY" $KEYFILE >/dev/null 2>&1 ; then
 	:
 else
@@ -19,13 +20,13 @@ else
 fi
 
 public_exponent=`
-	openssl rsa -noout -text -in $KEYFILE | grep ^publicExponent |
+	$OPENSSL_BIN rsa -noout -text -in $KEYFILE | grep ^publicExponent |
 	sed 's/.*(//;s/).*//'
 `
 test $? -ne 0 && exit 1
 
 modulus=`
-	openssl rsa -noout -modulus -in $KEYFILE | grep ^Modulus= |
+	$OPENSSL_BIN rsa -noout -modulus -in $KEYFILE | grep ^Modulus= |
 	sed 's/^Modulus=/0x/' | tr A-Z a-z
 `
 test $? -ne 0 && exit 1

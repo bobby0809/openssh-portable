@@ -25,6 +25,8 @@
 #include "includes.h"
 
 #include <sys/types.h>
+#include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <pwd.h>
@@ -54,14 +56,14 @@
 #  include <pwdadj.h>
 # endif
 
-# if defined(HAVE_MD5_PASSWORDS) && !defined(HAVE_MD5_CRYPT)
-#  include "md5crypt.h"
-# endif
-
 # if defined(WITH_OPENSSL) && !defined(HAVE_CRYPT) && defined(HAVE_DES_CRYPT)
 #  include <openssl/des.h>
 #  define crypt DES_crypt
 # endif
+
+#include "xmalloc.h"
+
+#define MINIMUM(a, b)	(((a) < (b)) ? (a) : (b))
 
 /*
  * Pick an appropriate password encryption type and salt for the running
@@ -73,7 +75,7 @@ static const char *
 pick_salt(void)
 {
 	struct passwd *pw;
-	char *passwd, *p;
+	char *passwd = NULL, *p;
 	size_t typelen;
 	static char salt[32];
 
@@ -82,16 +84,27 @@ pick_salt(void)
 	strlcpy(salt, "xx", sizeof(salt));
 	setpwent();
 	while ((pw = getpwent()) != NULL) {
+		if (passwd != NULL)
+			freezero(passwd, strlen(passwd));
 		if ((passwd = shadow_pw(pw)) == NULL)
 			continue;
 		if (passwd[0] == '$' && (p = strrchr(passwd+1, '$')) != NULL) {
 			typelen = p - passwd + 1;
-			strlcpy(salt, passwd, MIN(typelen, sizeof(salt)));
+			/*
+			 * bcrypt ($2*$NN$) has no '$' between its 22 character
+			 * salt and the hash, so keep the salt too or crypt(3)
+			 * will reject the setting without doing any work.
+			 */
+			if (passwd[1] == '2' && strlen(p + 1) >= 22)
+				typelen += 1 + 22;
+			strlcpy(salt, passwd, MINIMUM(typelen, sizeof(salt)));
 			explicit_bzero(passwd, strlen(passwd));
 			goto out;
 		}
 	}
  out:
+	if (passwd != NULL)
+		freezero(passwd, strlen(passwd));
 	endpwent();
 	return salt;
 }
@@ -108,12 +121,7 @@ xcrypt(const char *password, const char *salt)
 	if (salt == NULL)
 		salt = pick_salt();
 
-# ifdef HAVE_MD5_PASSWORDS
-	if (is_md5_salt(salt))
-		crypted = md5_crypt(password, salt);
-	else
-		crypted = crypt(password, salt);
-# elif defined(__hpux) && !defined(HAVE_SECUREWARE)
+#if defined(__hpux) && !defined(HAVE_SECUREWARE)
 	if (iscomsec())
 		crypted = bigcrypt(password, salt);
 	else
@@ -122,16 +130,15 @@ xcrypt(const char *password, const char *salt)
 	crypted = bigcrypt(password, salt);
 # else
 	crypted = crypt(password, salt);
-# endif
+#endif
 
 	return crypted;
 }
 
 /*
  * Handle shadowed password systems in a cleaner way for portable
- * version.
+ * version. Caller must free returned value.
  */
-
 char *
 shadow_pw(struct passwd *pw)
 {
@@ -145,7 +152,8 @@ shadow_pw(struct passwd *pw)
 # endif
 
 #ifdef USE_LIBIAF
-	return(get_iaf_password(pw));
+	pw_password = get_iaf_password(pw);
+	return pw_password == NULL ? NULL : xstrdup(pw_password);
 #endif
 
 # if defined(HAVE_GETPWANAM) && !defined(DISABLE_SHADOW)
@@ -159,5 +167,5 @@ shadow_pw(struct passwd *pw)
 		pw_password = spw->ufld.fd_encrypt;
 # endif
 
-	return pw_password;
+	return pw_password == NULL ? NULL : xstrdup(pw_password);
 }

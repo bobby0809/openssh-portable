@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh-keysign.c,v 1.66 2020/12/17 23:10:27 djm Exp $ */
+/* $OpenBSD: ssh-keysign.c,v 1.81 2026/06/14 03:59:34 djm Exp $ */
 /*
  * Copyright (c) 2002 Markus Friedl.  All rights reserved.
  *
@@ -26,9 +26,7 @@
 #include "includes.h"
 
 #include <fcntl.h>
-#ifdef HAVE_PATHS_H
 #include <paths.h>
-#endif
 #include <pwd.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -62,7 +60,7 @@
 extern char *__progname;
 
 static int
-valid_request(struct passwd *pw, char *host, struct sshkey **ret,
+valid_request(struct passwd *pw, char *host, struct sshkey **ret, char **pkalgp,
     u_char *data, size_t datalen)
 {
 	struct sshbuf *b;
@@ -75,15 +73,20 @@ valid_request(struct passwd *pw, char *host, struct sshkey **ret,
 
 	if (ret != NULL)
 		*ret = NULL;
+	if (pkalgp != NULL)
+		*pkalgp = NULL;
 	fail = 0;
 
 	if ((b = sshbuf_from(data, datalen)) == NULL)
 		fatal_f("sshbuf_from failed");
 
-	/* session id, currently limited to SHA1 (20 bytes) or SHA256 (32) */
+	/* session id */
 	if ((r = sshbuf_get_string(b, NULL, &len)) != 0)
 		fatal_fr(r, "parse session ID");
-	if (len != 20 && len != 32)
+	if (len != 20 && /* SHA1 */
+	    len != 32 && /* SHA256 */
+	    len != 48 && /* SHA384 */
+	    len != 64)   /* SHA512 */
 		fail++;
 
 	if ((r = sshbuf_get_u8(b, &type)) != 0)
@@ -122,14 +125,14 @@ valid_request(struct passwd *pw, char *host, struct sshkey **ret,
 		fail++;
 	} else if (key->type != pktype)
 		fail++;
-	free(pkalg);
-	free(pkblob);
 
 	/* client host name, handle trailing dot */
 	if ((r = sshbuf_get_cstring(b, &p, &len)) != 0)
 		fatal_fr(r, "parse hostname");
-	debug2_f("check expect chost %s got %s", host, p);
-	if (strlen(host) != len - 1)
+	debug2_f("check expect chost \"%s\" got \"%s\"", host, p);
+	if (len == 0)
+		fail++;
+	else if (strlen(host) != len - 1)
 		fail++;
 	else if (p[len - 1] != '.')
 		fail++;
@@ -152,10 +155,19 @@ valid_request(struct passwd *pw, char *host, struct sshkey **ret,
 
 	debug3_f("fail %d", fail);
 
-	if (fail)
-		sshkey_free(key);
-	else if (ret != NULL)
-		*ret = key;
+	if (!fail) {
+		if (ret != NULL) {
+			*ret = key;
+			key = NULL;
+		}
+		if (pkalgp != NULL) {
+			*pkalgp = pkalg;
+			pkalg = NULL;
+		}
+	}
+	sshkey_free(key);
+	free(pkalg);
+	free(pkblob);
 
 	return (fail ? -1 : 0);
 }
@@ -170,11 +182,8 @@ main(int argc, char **argv)
 	struct passwd *pw;
 	int r, key_fd[NUM_KEYTYPES], i, found, version = 2, fd;
 	u_char *signature, *data, rver;
-	char *host, *fp;
+	char *host, *fp, *pkalg;
 	size_t slen, dlen;
-
-	if (pledge("stdio rpath getpw dns id", NULL) != 0)
-		fatal("%s: pledge: %s", __progname, strerror(errno));
 
 	/* Ensure that stdin and stdout are connected */
 	if ((fd = open(_PATH_DEVNULL, O_RDWR)) < 2)
@@ -183,13 +192,18 @@ main(int argc, char **argv)
 	if (fd > 2)
 		close(fd);
 
+	if (pledge("stdio rpath getpw dns id", NULL) != 0)
+		fatal("%s: pledge: %s", __progname, strerror(errno));
+
+	for (i = 0; i < NUM_KEYTYPES; i++)
+		key_fd[i] = -1;
+
 	i = 0;
 	/* XXX This really needs to read sshd_config for the paths */
-	key_fd[i++] = open(_PATH_HOST_DSA_KEY_FILE, O_RDONLY);
 	key_fd[i++] = open(_PATH_HOST_ECDSA_KEY_FILE, O_RDONLY);
 	key_fd[i++] = open(_PATH_HOST_ED25519_KEY_FILE, O_RDONLY);
-	key_fd[i++] = open(_PATH_HOST_XMSS_KEY_FILE, O_RDONLY);
 	key_fd[i++] = open(_PATH_HOST_RSA_KEY_FILE, O_RDONLY);
+	key_fd[i++] = open(_PATH_HOST_MLDSA44_ED25519_KEY_FILE, O_RDONLY);
 
 	if ((pw = getpwuid(getuid())) == NULL)
 		fatal("getpwuid failed");
@@ -205,12 +219,15 @@ main(int argc, char **argv)
 
 	/* verify that ssh-keysign is enabled by the admin */
 	initialize_options(&options);
-	(void)read_config_file(_PATH_HOST_CONFIG_FILE, pw, "", "",
+	(void)read_config_file(_PATH_HOST_CONFIG_FILE, pw, "", "", "",
 	    &options, 0, NULL);
 	(void)fill_default_options(&options);
 	if (options.enable_ssh_keysign != 1)
 		fatal("ssh-keysign not enabled in %s",
 		    _PATH_HOST_CONFIG_FILE);
+
+	if (pledge("stdio dns", NULL) != 0)
+		fatal("%s: pledge: %s", __progname, strerror(errno));
 
 	for (i = found = 0; i < NUM_KEYTYPES; i++) {
 		if (key_fd[i] != -1)
@@ -237,9 +254,6 @@ main(int argc, char **argv)
 	if (!found)
 		fatal("no hostkey found");
 
-	if (pledge("stdio dns", NULL) != 0)
-		fatal("%s: pledge: %s", __progname, strerror(errno));
-
 	if ((b = sshbuf_new()) == NULL)
 		fatal("%s: sshbuf_new failed", __progname);
 	if (ssh_msg_recv(STDIN_FILENO, b) < 0)
@@ -251,14 +265,14 @@ main(int argc, char **argv)
 		    __progname, rver, version);
 	if ((r = sshbuf_get_u32(b, (u_int *)&fd)) != 0)
 		fatal_r(r, "%s: buffer error", __progname);
-	if (fd < 0 || fd == STDIN_FILENO || fd == STDOUT_FILENO)
+	if (fd <= STDERR_FILENO)
 		fatal("%s: bad fd = %d", __progname, fd);
 	if ((host = get_local_name(fd)) == NULL)
 		fatal("%s: cannot get local name for fd", __progname);
 
 	if ((r = sshbuf_get_string(b, &data, &dlen)) != 0)
 		fatal_r(r, "%s: buffer error", __progname);
-	if (valid_request(pw, host, &key, data, dlen) < 0)
+	if (valid_request(pw, host, &key, &pkalg, data, dlen) < 0)
 		fatal("%s: not a valid request", __progname);
 	free(host);
 
@@ -279,7 +293,7 @@ main(int argc, char **argv)
 	}
 
 	if ((r = sshkey_sign(keys[i], &signature, &slen, data, dlen,
-	    NULL, NULL, NULL, 0)) != 0)
+	    pkalg, NULL, NULL, 0)) != 0)
 		fatal_r(r, "%s: sshkey_sign failed", __progname);
 	free(data);
 

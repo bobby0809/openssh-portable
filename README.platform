@@ -53,11 +53,12 @@ Darwin does not provide a tun(4) driver required for OpenSSH-based
 virtual private networks. The BSD manpage still exists, but the driver
 has been removed in recent releases of Darwin and MacOS X.
 
-Nevertheless, tunnel support is known to work with Darwin 8 and
-MacOS X 10.4 in Point-to-Point (Layer 3) and Ethernet (Layer 2) mode
-using a third party driver. More information is available at:
-	http://www-user.rhrk.uni-kl.de/~nissler/tuntap/
+Tunnel support is known to work with Darwin 8 and MacOS X 10.4 in
+Point-to-Point (Layer 3) and Ethernet (Layer 2) mode using a third
+party driver. More information is available at:
+	https://tuntaposx.sourceforge.net
 
+Tunnels on recent Darwin/MacOS X versions are likely unsupported.
 
 Linux
 -----
@@ -67,8 +68,8 @@ headers and library links in the -devel RPMs rather than the main
 binary RPMs. If you get an error about headers, or complaining about a
 missing prerequisite then you may need to install the equivalent
 development packages.  On Redhat based distros these may be openssl-devel,
-zlib-devel and pam-devel, on Debian based distros these may be
-libssl-dev, libz-dev and libpam-dev.
+zlib-devel and pam-devel, on Debian based distros these may be libc-dev,
+libcrypt-dev, libssl-dev, libz-dev and libpam-dev.
 
 
 Solaris

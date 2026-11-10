@@ -1,4 +1,4 @@
-/* $OpenBSD: hostfile.c,v 1.90 2021/04/03 06:58:30 djm Exp $ */
+/* $OpenBSD: hostfile.c,v 1.102 2026/10/30 08:23:58 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -118,7 +118,7 @@ host_hash(const char *host, const char *name_from_hostfile, u_int src_len)
 	struct ssh_hmac_ctx *ctx;
 	u_char salt[256], result[256];
 	char uu_salt[512], uu_result[512];
-	static char encoded[1024];
+	char *encoded = NULL;
 	u_int len;
 
 	len = ssh_digest_bytes(SSH_DIGEST_SHA1);
@@ -143,16 +143,15 @@ host_hash(const char *host, const char *name_from_hostfile, u_int src_len)
 	if (__b64_ntop(salt, len, uu_salt, sizeof(uu_salt)) == -1 ||
 	    __b64_ntop(result, len, uu_result, sizeof(uu_result)) == -1)
 		fatal_f("__b64_ntop failed");
-
-	snprintf(encoded, sizeof(encoded), "%s%s%c%s", HASH_MAGIC, uu_salt,
-	    HASH_DELIM, uu_result);
+	xasprintf(&encoded, "%s%s%c%s", HASH_MAGIC, uu_salt, HASH_DELIM,
+	    uu_result);
 
 	return (encoded);
 }
 
 /*
- * Parses an RSA (number of bits, e, n) or DSA key from a string.  Moves the
- * pointer over the key.  Skips any whitespace at the beginning and at end.
+ * Parses an RSA key from a string. Moves the pointer over the key.
+ * Skips any whitespace at the beginning and at end.
  */
 
 int
@@ -189,8 +188,7 @@ check_markers(char **cpp)
 		if (ret != MRK_NONE)
 			return MRK_ERROR;
 		/* Markers are terminated by whitespace */
-		if ((sp = strchr(cp, ' ')) == NULL &&
-		    (sp = strchr(cp, '\t')) == NULL)
+		if ((sp = strpbrk(cp, " \t")) == NULL)
 			return MRK_ERROR;
 		/* Extract marker for comparison */
 		if (sp <= cp + 1 || sp >= cp + sizeof(marker))
@@ -435,7 +433,7 @@ lookup_marker_in_hostkeys(struct hostkeys *hostkeys, int want_marker)
 }
 
 static int
-write_host_entry(FILE *f, const char *host, const char *ip,
+format_host_entry(struct sshbuf *entry, const char *host, const char *ip,
     const struct sshkey *key, int store_hash)
 {
 	int r, success = 0;
@@ -450,21 +448,50 @@ write_host_entry(FILE *f, const char *host, const char *ip,
 			free(lhost);
 			return 0;
 		}
-		fprintf(f, "%s ", hashed_host);
-	} else if (ip != NULL)
-		fprintf(f, "%s,%s ", lhost, ip);
-	else {
-		fprintf(f, "%s ", lhost);
+		if ((r = sshbuf_putf(entry, "%s ", hashed_host)) != 0)
+			fatal_fr(r, "sshbuf_putf");
+	} else if (ip != NULL) {
+		if ((r = sshbuf_putf(entry, "%s,%s ", lhost, ip)) != 0)
+			fatal_fr(r, "sshbuf_putf");
+	} else {
+		if ((r = sshbuf_putf(entry, "%s ", lhost)) != 0)
+			fatal_fr(r, "sshbuf_putf");
 	}
+	free(hashed_host);
 	free(lhost);
-	if ((r = sshkey_write(key, f)) == 0)
+	if ((r = sshkey_format_text(key, entry)) == 0)
 		success = 1;
 	else
 		error_fr(r, "sshkey_write");
-	fputc('\n', f);
+	if ((r = sshbuf_putf(entry, "\n")) != 0)
+		fatal_fr(r, "sshbuf_putf");
+
 	/* If hashing is enabled, the IP address needs to go on its own line */
 	if (success && store_hash && ip != NULL)
-		success = write_host_entry(f, ip, NULL, key, 1);
+		success = format_host_entry(entry, ip, NULL, key, 1);
+	return success;
+}
+
+static int
+write_host_entry(FILE *f, const char *host, const char *ip,
+    const struct sshkey *key, int store_hash)
+{
+	int r, success = 0;
+	struct sshbuf *entry = NULL;
+
+	if ((entry = sshbuf_new()) == NULL)
+		fatal_f("allocation failed");
+	if ((r = format_host_entry(entry, host, ip, key, store_hash)) != 1) {
+		debug_f("failed to format host entry");
+		goto out;
+	}
+	if ((r = fwrite(sshbuf_ptr(entry), sshbuf_len(entry), 1, f)) != 1) {
+		error_f("fwrite: %s", strerror(errno));
+		goto out;
+	}
+	success = 1;
+ out:
+	sshbuf_free(entry);
 	return success;
 }
 
@@ -515,14 +542,23 @@ add_host_to_hostfile(const char *filename, const char *host,
     const struct sshkey *key, int store_hash)
 {
 	FILE *f;
-	int success;
+	int success, addnl = 0;
 
 	if (key == NULL)
 		return 1;	/* XXX ? */
 	hostfile_create_user_ssh_dir(filename, 0);
-	f = fopen(filename, "a");
-	if (!f)
+	if ((f = fopen(filename, "a+")) == NULL)
 		return 0;
+	setvbuf(f, NULL, _IONBF, 0);
+	/* Make sure we have a terminating newline. */
+	if (fseek(f, -1L, SEEK_END) == 0 && fgetc(f) != '\n')
+		addnl = 1;
+	if (fseek(f, 0L, SEEK_END) != 0 || (addnl && fputc('\n', f) != '\n')) {
+		error("Failed to add terminating newline to %s: %s",
+		   filename, strerror(errno));
+		fclose(f);
+		return 0;
+	}
 	success = write_host_entry(f, host, NULL, key, store_hash);
 	fclose(f);
 	return success;
@@ -556,7 +592,8 @@ host_delete(struct hostkey_foreach_line *l, void *_ctx)
 			if (!sshkey_equal(ctx->keys[i], l->key))
 				continue;
 			ctx->match_keys[i] |= l->match;
-			fprintf(ctx->out, "%s\n", l->line);
+			if (fprintf(ctx->out, "%s\n", l->line) < 0)
+				return SSH_ERR_SYSTEM_ERROR;
 			debug3_f("%s key already at %s:%ld",
 			    sshkey_type(l->key), l->path, l->linenum);
 			return 0;
@@ -578,7 +615,8 @@ host_delete(struct hostkey_foreach_line *l, void *_ctx)
 		    ctx->quiet ? __func__ : "", ctx->quiet ? ": " : "",
 		    l->path, l->linenum);
 	}
-	fprintf(ctx->out, "%s\n", l->line);
+	if (fprintf(ctx->out, "%s\n", l->line) < 0)
+		return SSH_ERR_SYSTEM_ERROR;
 	return 0;
 }
 
@@ -589,7 +627,7 @@ hostfile_replace_entries(const char *filename, const char *host, const char *ip,
 	int r, fd, oerrno = 0;
 	int loglevel = quiet ? SYSLOG_LEVEL_DEBUG1 : SYSLOG_LEVEL_VERBOSE;
 	struct host_delete_ctx ctx;
-	char *fp, *temp = NULL, *back = NULL;
+	char *fp = NULL, *temp = NULL, *back = NULL;
 	const char *what;
 	mode_t omask;
 	size_t i;
@@ -642,7 +680,7 @@ hostfile_replace_entries(const char *filename, const char *host, const char *ip,
 	/* Re-add the requested keys */
 	want = HKF_MATCH_HOST | (ip == NULL ? 0 : HKF_MATCH_IP);
 	for (i = 0; i < nkeys; i++) {
-		if ((want & ctx.match_keys[i]) == want)
+		if (keys[i] == NULL || (want & ctx.match_keys[i]) == want)
 			continue;
 		if ((fp = sshkey_fingerprint(keys[i], hash_alg,
 		    SSH_FP_DEFAULT)) == NULL) {
@@ -678,10 +716,18 @@ hostfile_replace_entries(const char *filename, const char *host, const char *ip,
 		    host, ip == NULL ? "" : ",", ip == NULL ? "" : ip, filename,
 		    sshkey_ssh_name(keys[i]), fp);
 		free(fp);
+		fp = NULL;
 		ctx.modified = 1;
 	}
-	fclose(ctx.out);
+	/* Don't replace the original with an incompletely-written copy */
+	r = fclose(ctx.out);
 	ctx.out = NULL;
+	if (r != 0) {
+		oerrno = errno;
+		error_f("fclose \"%s\": %s", temp, strerror(oerrno));
+		r = SSH_ERR_SYSTEM_ERROR;
+		goto fail;
+	}
 
 	if (ctx.modified) {
 		/* Backup the original file and replace it with the temporary */
@@ -718,6 +764,7 @@ hostfile_replace_entries(const char *filename, const char *host, const char *ip,
 		unlink(temp);
 	free(temp);
 	free(back);
+	free(fp);
 	if (ctx.out != NULL)
 		fclose(ctx.out);
 	free(ctx.match_keys);
@@ -730,8 +777,8 @@ hostfile_replace_entries(const char *filename, const char *host, const char *ip,
 static int
 match_maybe_hashed(const char *host, const char *names, int *was_hashed)
 {
-	int hashed = *names == HASH_DELIM;
-	const char *hashed_host;
+	int hashed = *names == HASH_DELIM, ret;
+	char *hashed_host = NULL;
 	size_t nlen = strlen(names);
 
 	if (was_hashed != NULL)
@@ -739,8 +786,10 @@ match_maybe_hashed(const char *host, const char *names, int *was_hashed)
 	if (hashed) {
 		if ((hashed_host = host_hash(host, names, nlen)) == NULL)
 			return -1;
-		return nlen == strlen(hashed_host) &&
-		    strncmp(hashed_host, names, nlen) == 0;
+		ret = (nlen == strlen(hashed_host) &&
+		    strncmp(hashed_host, names, nlen) == 0);
+		free(hashed_host);
+		return ret;
 	}
 	return match_hostname(host, names) == 1;
 }
@@ -799,6 +848,12 @@ hostkeys_foreach_file(const char *path, FILE *f, hostkeys_foreach_fn *callback,
 		/* Find the end of the host name portion. */
 		for (cp2 = cp; *cp2 && *cp2 != ' ' && *cp2 != '\t'; cp2++)
 			;
+		if (*cp2 == '\0') {
+			verbose_f("truncated line at %s:%lu", path, linenum);
+			if ((options & HKF_WANT_MATCH) == 0)
+				goto bad;
+			continue;
+		}
 		lineinfo.hosts = cp;
 		*cp2++ = '\0';
 
@@ -909,6 +964,9 @@ hostkeys_foreach_file(const char *path, FILE *f, hostkeys_foreach_fn *callback,
 		if ((r = callback(&lineinfo, ctx)) != 0)
 			break;
 	}
+	/* A read error must not be mistaken for the end of the file */
+	if (r == 0 && ferror(f))
+		r = SSH_ERR_SYSTEM_ERROR;
 	sshkey_free(lineinfo.key);
 	free(lineinfo.line);
 	free(line);

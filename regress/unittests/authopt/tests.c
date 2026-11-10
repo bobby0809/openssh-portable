@@ -1,4 +1,4 @@
-/* 	$OpenBSD: tests.c,v 1.1 2018/03/03 03:16:17 djm Exp $ */
+/* 	$OpenBSD: tests.c,v 1.7 2026/09/16 04:56:12 djm Exp $ */
 
 /*
  * Regress test for keys options functions.
@@ -9,7 +9,6 @@
 #include "includes.h"
 
 #include <sys/types.h>
-#include <sys/param.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -142,6 +141,7 @@ test_authkeys_parse(void)
 		opts = sshauthopt_parse(keywords, &errstr); \
 		ASSERT_PTR_EQ(opts, NULL); \
 		ASSERT_PTR_NE(errstr, NULL); \
+		sshauthopt_free(opts); \
 		TEST_DONE(); \
 	} while (0) 
 #define CHECK_SUCCESS_AND_CLEANUP() \
@@ -270,6 +270,8 @@ test_authkeys_parse(void)
 	} while (0)
 	ARRAY_TEST("environment", "environment=\"foo=1\",environment=\"bar=2\"",
 	    env, nenv, "foo=1,bar=2");
+	ARRAY_TEST("environment", "environment=\"foo=1\",environment=\"foo=2\"",
+	    env, nenv, "foo=1");
 	ARRAY_TEST("permitopen", "permitopen=\"foo:123\",permitopen=\"bar:*\"",
 	    permitopen, npermitopen, "foo:123,bar:*");
 #undef ARRAY_TEST
@@ -416,13 +418,15 @@ test_merge(void)
 	} while (0)
 
 	/* Check a single case of merging of flag options */
-#define FLAG_CASE(keybase, label, keyname, keywords, mostly_off, var, val) \
+#define FLAG_CASE(keybase, label, keyname, keywords, mostly_off, \
+	    rflag, var, val) \
 	do { \
 		PREPARE(keybase " " label, keyname, keywords); \
 		expected = mostly_off ? \
 		    sshauthopt_new() : default_authkey_opts(); \
-		expected->var = val; \
 		ASSERT_PTR_NE(expected, NULL); \
+		expected->restricted = rflag; \
+		expected->var = val; \
 		CHECK_SUCCESS_AND_CLEANUP(); \
 		TEST_DONE(); \
 	} while (0)
@@ -435,40 +439,40 @@ test_merge(void)
 #define FLAG_TEST(keybase, keyword, var) \
 	do { \
 		FLAG_CASE(keybase, "keys:default,yes cert:default,no", \
-		    "no_" keybase, keyword, 0, var, 0); \
+		    "no_" keybase, keyword, 0, 0, var, 0); \
 		FLAG_CASE(keybase,"keys:-*,yes cert:default,no", \
-		    "no_" keybase, "restrict," keyword, 1, var, 0); \
+		    "no_" keybase, "restrict," keyword, 1, 1, var, 0); \
 		FLAG_CASE(keybase, "keys:default,no cert:default,no", \
-		    "no_" keybase, "no-" keyword, 0, var, 0); \
+		    "no_" keybase, "no-" keyword, 0, 0, var, 0); \
 		FLAG_CASE(keybase, "keys:-*,no cert:default,no", \
-		    "no_" keybase, "restrict,no-" keyword, 1, var, 0); \
+		    "no_" keybase, "restrict,no-" keyword, 1, 1, var, 0); \
 		\
 		FLAG_CASE(keybase, "keys:default,yes cert:-*,yes", \
-		    "only_" keybase, keyword, 1, var, 1); \
+		    "only_" keybase, keyword, 1, 0, var, 1); \
 		FLAG_CASE(keybase,"keys:-*,yes cert:-*,yes", \
-		    "only_" keybase, "restrict," keyword, 1, var, 1); \
+		    "only_" keybase, "restrict," keyword, 1, 1, var, 1); \
 		FLAG_CASE(keybase, "keys:default,no cert:-*,yes", \
-		    "only_" keybase, "no-" keyword, 1, var, 0); \
+		    "only_" keybase, "no-" keyword, 1, 0, var, 0); \
 		FLAG_CASE(keybase, "keys:-*,no cert:-*,yes", \
-		    "only_" keybase, "restrict,no-" keyword, 1, var, 0); \
+		    "only_" keybase, "restrict,no-" keyword, 1, 1, var, 0); \
 		\
 		FLAG_CASE(keybase, "keys:default,yes cert:-*", \
-		    "no_permit", keyword, 1, var, 0); \
+		    "no_permit", keyword, 1, 0, var, 0); \
 		FLAG_CASE(keybase,"keys:-*,yes cert:-*", \
-		    "no_permit", "restrict," keyword, 1, var, 0); \
+		    "no_permit", "restrict," keyword, 1, 1, var, 0); \
 		FLAG_CASE(keybase, "keys:default,no cert:-*", \
-		    "no_permit", "no-" keyword, 1, var, 0); \
+		    "no_permit", "no-" keyword, 1, 0, var, 0); \
 		FLAG_CASE(keybase, "keys:-*,no cert:-*", \
-		    "no_permit", "restrict,no-" keyword, 1, var, 0); \
+		    "no_permit", "restrict,no-" keyword, 1, 1, var, 0); \
 		\
 		FLAG_CASE(keybase, "keys:default,yes cert:*", \
-		    "all_permit", keyword, 0, var, 1); \
+		    "all_permit", keyword, 0, 0, var, 1); \
 		FLAG_CASE(keybase,"keys:-*,yes cert:*", \
-		    "all_permit", "restrict," keyword, 1, var, 1); \
+		    "all_permit", "restrict," keyword, 1, 1, var, 1); \
 		FLAG_CASE(keybase, "keys:default,no cert:*", \
-		    "all_permit", "no-" keyword, 0, var, 0); \
+		    "all_permit", "no-" keyword, 0, 0, var, 0); \
 		FLAG_CASE(keybase, "keys:-*,no cert:*", \
-		    "all_permit", "restrict,no-" keyword, 1, var, 0); \
+		    "all_permit", "restrict,no-" keyword, 1, 1, var, 0); \
 		\
 	} while (0)
 	FLAG_TEST("portfwd", "port-forwarding", permit_port_forwarding_flag);
@@ -572,4 +576,10 @@ tests(void)
 	test_authkeys_parse();
 	test_cert_parse();
 	test_merge();
+}
+
+void
+benchmarks(void)
+{
+	printf("no benchmarks\n");
 }

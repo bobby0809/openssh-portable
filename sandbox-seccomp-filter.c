@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2012 Will Drewry <wad@dataspill.org>
+ * Copyright (c) 2015,2017,2019,2020,2023 Damien Miller <djm@mindrot.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -25,15 +26,18 @@
  */
 /* #define SANDBOX_SECCOMP_FILTER_DEBUG 1 */
 
-/* XXX it should be possible to do logging via the log socket safely */
-
+#if 0
+/*
+ * For older toolchains, it may be necessary to use the kernel
+ * headers directly.
+ */
 #ifdef SANDBOX_SECCOMP_FILTER_DEBUG
-/* Use the kernel headers in case of an older toolchain. */
 # include <asm/siginfo.h>
 # define __have_siginfo_t 1
 # define __have_sigval_t 1
 # define __have_sigevent_t 1
 #endif /* SANDBOX_SECCOMP_FILTER_DEBUG */
+#endif
 
 #include "includes.h"
 
@@ -45,6 +49,9 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 
+#include <netinet/ip.h>
+
+#include <linux/futex.h>
 #include <linux/net.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
@@ -129,6 +136,133 @@
 	/* reload syscall number; all rules expect it in accumulator */ \
 	BPF_STMT(BPF_LD+BPF_W+BPF_ABS, \
 		offsetof(struct seccomp_data, nr))
+/* Deny unless syscall argument contains only values in mask */
+#define SC_DENY_UNLESS_ARG_MASK(_nr, _arg_nr, _arg_mask, _errno) \
+	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, (_nr), 0, 8), \
+	/* load, mask and test syscall argument, low word */ \
+	BPF_STMT(BPF_LD+BPF_W+BPF_ABS, \
+	    offsetof(struct seccomp_data, args[(_arg_nr)]) + ARG_LO_OFFSET), \
+	BPF_STMT(BPF_ALU+BPF_AND+BPF_K, ~((_arg_mask) & 0xFFFFFFFF)), \
+	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, 0, 0, 3), \
+	/* load, mask and test syscall argument, high word */ \
+	BPF_STMT(BPF_LD+BPF_W+BPF_ABS, \
+	    offsetof(struct seccomp_data, args[(_arg_nr)]) + ARG_HI_OFFSET), \
+	BPF_STMT(BPF_ALU+BPF_AND+BPF_K, \
+	    ~(((uint32_t)((uint64_t)(_arg_mask) >> 32)) & 0xFFFFFFFF)), \
+	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, 0, 1, 0), \
+	BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_ERRNO|(_errno)), \
+	/* reload syscall number; all rules expect it in accumulator */ \
+	BPF_STMT(BPF_LD+BPF_W+BPF_ABS, \
+		offsetof(struct seccomp_data, nr))
+/* Deny unless syscall argument contains all values in mask */
+#define SC_DENY_UNLESS_ARG_BITS(_nr, _arg_nr, _arg_mask, _errno) \
+	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, (_nr), 0, 8), \
+	/* load, mask and test syscall argument, low word */ \
+	BPF_STMT(BPF_LD+BPF_W+BPF_ABS, \
+	    offsetof(struct seccomp_data, args[(_arg_nr)]) + ARG_LO_OFFSET), \
+	BPF_STMT(BPF_ALU+BPF_AND+BPF_K, ((_arg_mask) & 0xFFFFFFFF)), \
+	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, ((_arg_mask) & 0xFFFFFFFF), 0, 3), \
+	/* load, mask and test syscall argument, high word */ \
+	BPF_STMT(BPF_LD+BPF_W+BPF_ABS, \
+	    offsetof(struct seccomp_data, args[(_arg_nr)]) + ARG_HI_OFFSET), \
+	BPF_STMT(BPF_ALU+BPF_AND+BPF_K, \
+	    (((uint32_t)((uint64_t)(_arg_mask) >> 32)) & 0xFFFFFFFF)), \
+	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, \
+	    (((uint32_t)((uint64_t)(_arg_mask) >> 32)) & 0xFFFFFFFF), 1, 0), \
+	BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_ERRNO|(_errno)), \
+	/* reload syscall number; all rules expect it in accumulator */ \
+	BPF_STMT(BPF_LD+BPF_W+BPF_ABS, \
+		offsetof(struct seccomp_data, nr))
+#define SC_DENY_UNLESS_MASK(_nr, _arg_nr, _arg_val, _errno) \
+/* Special handling for futex(2) that combines a bitmap and operation number */
+#if defined(__NR_futex) || defined(__NR_futex_time64)
+#define SC_FUTEX_MASK (FUTEX_PRIVATE_FLAG|FUTEX_CLOCK_REALTIME)
+#define SC_ALLOW_FUTEX_OP(_nr, _op) \
+	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, (_nr), 0, 8), \
+	/* load syscall argument, low word */ \
+	BPF_STMT(BPF_LD+BPF_W+BPF_ABS, \
+	    offsetof(struct seccomp_data, args[1]) + ARG_LO_OFFSET), \
+	/* mask off allowed bitmap values, low word */ \
+	BPF_STMT(BPF_ALU+BPF_AND+BPF_K, ~(SC_FUTEX_MASK & 0xFFFFFFFF)), \
+	/* test operation number, low word */ \
+	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, ((_op) & 0xFFFFFFFF), 0, 4), \
+	/* load syscall argument, high word */ \
+	BPF_STMT(BPF_LD+BPF_W+BPF_ABS, \
+	    offsetof(struct seccomp_data, args[1]) + ARG_HI_OFFSET), \
+	/* mask off allowed bitmap values, high word */ \
+	BPF_STMT(BPF_ALU+BPF_AND+BPF_K, \
+	    ~(((uint32_t)((uint64_t)SC_FUTEX_MASK >> 32)) & 0xFFFFFFFF)), \
+	/* test operation number, high word */ \
+	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, \
+	    (((uint32_t)((uint64_t)(_op) >> 32)) & 0xFFFFFFFF), 0, 1), \
+	BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_ALLOW), \
+	/* reload syscall number; all rules expect it in accumulator */ \
+	BPF_STMT(BPF_LD+BPF_W+BPF_ABS, offsetof(struct seccomp_data, nr))
+
+/* Use this for both __NR_futex and __NR_futex_time64 */
+# define SC_FUTEX(_nr) \
+	SC_ALLOW_FUTEX_OP(_nr, FUTEX_WAIT), \
+	SC_ALLOW_FUTEX_OP(_nr, FUTEX_WAIT_BITSET), \
+	SC_ALLOW_FUTEX_OP(_nr, FUTEX_WAKE), \
+	SC_ALLOW_FUTEX_OP(_nr, FUTEX_WAKE_BITSET), \
+	SC_ALLOW_FUTEX_OP(_nr, FUTEX_REQUEUE), \
+	SC_ALLOW_FUTEX_OP(_nr, FUTEX_CMP_REQUEUE)
+#endif /* __NR_futex || __NR_futex_time64 */
+
+#if defined(__NR_mmap) || defined(__NR_mmap2)
+# ifdef MAP_FIXED_NOREPLACE
+#  define SC_MMAP_FLAGS MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED|MAP_FIXED_NOREPLACE
+# else
+#  define SC_MMAP_FLAGS MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED
+# endif /* MAP_FIXED_NOREPLACE */
+/*
+ * Use this for both __NR_mmap and __NR_mmap2 variants.
+ * Only anonymous mappings are needed; requiring MAP_ANONYMOUS prevents
+ * mapping of any file descriptor the process holds (e.g. the client socket).
+ */
+# define SC_MMAP(_nr) \
+	SC_DENY_UNLESS_ARG_MASK(_nr, 3, SC_MMAP_FLAGS, EINVAL), \
+	SC_DENY_UNLESS_ARG_BITS(_nr, 3, MAP_ANONYMOUS, EINVAL), \
+	SC_ALLOW_ARG_MASK(_nr, 2, PROT_READ|PROT_WRITE|PROT_NONE)
+#endif /* __NR_mmap || __NR_mmap2 */
+
+/*
+ * Special handling for clock_gettime(2), clock_nanosleep(2) and their
+ * time64 variants: only permit the fixed clock IDs, CLOCK_REALTIME (0)
+ * through CLOCK_BOOTTIME (7). Negative clock IDs name the CPU-time clock
+ * of an arbitrary process, which the kernel lets anyone read.
+ */
+#define SC_CLOCKID_MASK 0x7
+/* Use this for all clock_*(2) variants */
+#define SC_CLOCK(_nr) \
+	SC_ALLOW_ARG_MASK(_nr, 0, SC_CLOCKID_MASK), \
+	SC_DENY(_nr, EINVAL)
+
+/* Special handling for setsockopt(2) */
+#define SC_ALLOW_SETSOCKOPT(_level, _optname) \
+	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, __NR_setsockopt, 0, 10), \
+	/* load and test level, low word */ \
+	BPF_STMT(BPF_LD+BPF_W+BPF_ABS, \
+	    offsetof(struct seccomp_data, args[1]) + ARG_LO_OFFSET), \
+	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, \
+	    ((_level) & 0xFFFFFFFF), 0, 7), \
+	/* load and test level high word is zero */ \
+	BPF_STMT(BPF_LD+BPF_W+BPF_ABS, \
+	    offsetof(struct seccomp_data, args[1]) + ARG_HI_OFFSET), \
+	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, 0, 0, 5), \
+	/* load and test optname, low word */ \
+	BPF_STMT(BPF_LD+BPF_W+BPF_ABS, \
+	    offsetof(struct seccomp_data, args[2]) + ARG_LO_OFFSET), \
+	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, \
+	    ((_optname) & 0xFFFFFFFF), 0, 3), \
+	/* load and test level high word is zero */ \
+	BPF_STMT(BPF_LD+BPF_W+BPF_ABS, \
+	    offsetof(struct seccomp_data, args[2]) + ARG_HI_OFFSET), \
+	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, 0, 0, 1), \
+	BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_ALLOW), \
+	/* reload syscall number; all rules expect it in accumulator */ \
+	BPF_STMT(BPF_LD+BPF_W+BPF_ABS, \
+		offsetof(struct seccomp_data, nr))
 
 /* Syscall filtering set for preauth. */
 static const struct sock_filter preauth_insns[] = {
@@ -193,10 +327,10 @@ static const struct sock_filter preauth_insns[] = {
 	SC_ALLOW(__NR_brk),
 #endif
 #ifdef __NR_clock_gettime
-	SC_ALLOW(__NR_clock_gettime),
+	SC_CLOCK(__NR_clock_gettime),
 #endif
 #ifdef __NR_clock_gettime64
-	SC_ALLOW(__NR_clock_gettime64),
+	SC_CLOCK(__NR_clock_gettime64),
 #endif
 #ifdef __NR_close
 	SC_ALLOW(__NR_close),
@@ -208,10 +342,10 @@ static const struct sock_filter preauth_insns[] = {
 	SC_ALLOW(__NR_exit_group),
 #endif
 #ifdef __NR_futex
-	SC_ALLOW(__NR_futex),
+	SC_FUTEX(__NR_futex),
 #endif
 #ifdef __NR_futex_time64
-	SC_ALLOW(__NR_futex_time64),
+	SC_FUTEX(__NR_futex_time64),
 #endif
 #ifdef __NR_geteuid
 	SC_ALLOW(__NR_geteuid),
@@ -220,13 +354,16 @@ static const struct sock_filter preauth_insns[] = {
 	SC_ALLOW(__NR_geteuid32),
 #endif
 #ifdef __NR_getpgid
-	SC_ALLOW(__NR_getpgid),
+	SC_ALLOW_ARG(__NR_getpgid, 0, 0),
 #endif
 #ifdef __NR_getpid
 	SC_ALLOW(__NR_getpid),
 #endif
 #ifdef __NR_getrandom
 	SC_ALLOW(__NR_getrandom),
+#endif
+#ifdef __NR_gettid
+	SC_ALLOW(__NR_gettid),
 #endif
 #ifdef __NR_gettimeofday
 	SC_ALLOW(__NR_gettimeofday),
@@ -238,19 +375,46 @@ static const struct sock_filter preauth_insns[] = {
 	SC_ALLOW(__NR_getuid32),
 #endif
 #ifdef __NR_madvise
-	SC_ALLOW(__NR_madvise),
+	SC_ALLOW_ARG(__NR_madvise, 2, MADV_NORMAL),
+# ifdef MADV_FREE
+	SC_ALLOW_ARG(__NR_madvise, 2, MADV_FREE),
+# endif
+# ifdef MADV_DONTNEED
+	SC_ALLOW_ARG(__NR_madvise, 2, MADV_DONTNEED),
+# endif
+# ifdef MADV_DONTNEED_LOCKED
+	SC_ALLOW_ARG(__NR_madvise, 2, MADV_DONTNEED_LOCKED),
+# endif
+# ifdef MADV_DONTFORK
+	SC_ALLOW_ARG(__NR_madvise, 2, MADV_DONTFORK),
+# endif
+# ifdef MADV_DONTDUMP
+	SC_ALLOW_ARG(__NR_madvise, 2, MADV_DONTDUMP),
+# endif
+# ifdef MADV_WIPEONFORK
+	SC_ALLOW_ARG(__NR_madvise, 2, MADV_WIPEONFORK),
+# endif
+	SC_DENY(__NR_madvise, EINVAL),
 #endif
-#ifdef __NR_mmap
-	SC_ALLOW_ARG_MASK(__NR_mmap, 2, PROT_READ|PROT_WRITE|PROT_NONE),
+#if defined(__NR_mmap) && !defined(__i386__)
+	/*
+	 * On i386, __NR_mmap is old_mmap(2), which takes its arguments via
+	 * a struct in memory that the filter cannot inspect, so SC_MMAP's
+	 * prot and flags checks would be ineffective. Don't allow it; libc
+	 * uses mmap2(2) there. NB. s390 passes the arguments to both
+	 * variants this way and has no alternative, so the checks cannot
+	 * be relied upon on that platform.
+	 */
+	SC_MMAP(__NR_mmap),
 #endif
 #ifdef __NR_mmap2
-	SC_ALLOW_ARG_MASK(__NR_mmap2, 2, PROT_READ|PROT_WRITE|PROT_NONE),
+	SC_MMAP(__NR_mmap2),
 #endif
 #ifdef __NR_mprotect
 	SC_ALLOW_ARG_MASK(__NR_mprotect, 2, PROT_READ|PROT_WRITE|PROT_NONE),
 #endif
 #ifdef __NR_mremap
-	SC_ALLOW(__NR_mremap),
+	SC_ALLOW_ARG_MASK(__NR_mremap, 3, MREMAP_MAYMOVE),
 #endif
 #ifdef __NR_munmap
 	SC_ALLOW(__NR_munmap),
@@ -259,16 +423,19 @@ static const struct sock_filter preauth_insns[] = {
 	SC_ALLOW(__NR_nanosleep),
 #endif
 #ifdef __NR_clock_nanosleep
-	SC_ALLOW(__NR_clock_nanosleep),
+	SC_CLOCK(__NR_clock_nanosleep),
 #endif
 #ifdef __NR_clock_nanosleep_time64
-	SC_ALLOW(__NR_clock_nanosleep_time64),
-#endif
-#ifdef __NR_clock_gettime64
-	SC_ALLOW(__NR_clock_gettime64),
+	SC_CLOCK(__NR_clock_nanosleep_time64),
 #endif
 #ifdef __NR__newselect
 	SC_ALLOW(__NR__newselect),
+#endif
+#ifdef __NR_ppoll
+	SC_ALLOW(__NR_ppoll),
+#endif
+#ifdef __NR_ppoll_time64
+	SC_ALLOW(__NR_ppoll_time64),
 #endif
 #ifdef __NR_poll
 	SC_ALLOW(__NR_poll),
@@ -281,6 +448,9 @@ static const struct sock_filter preauth_insns[] = {
 #endif
 #ifdef __NR_read
 	SC_ALLOW(__NR_read),
+#endif
+#ifdef __NR_riscv_hwprobe
+	SC_ALLOW(__NR_riscv_hwprobe),
 #endif
 #ifdef __NR_rt_sigprocmask
 	SC_ALLOW(__NR_rt_sigprocmask),
@@ -300,7 +470,32 @@ static const struct sock_filter preauth_insns[] = {
 #ifdef __NR_write
 	SC_ALLOW(__NR_write),
 #endif
+#ifdef __NR_writev
+	SC_ALLOW(__NR_writev),
+#endif
+#ifdef __NR_getsockopt
+	SC_ALLOW(__NR_getsockopt),
+#endif
+#ifdef __NR_getsockname
+	SC_ALLOW(__NR_getsockname),
+#endif
+#ifdef __NR_getpeername
+	SC_ALLOW(__NR_getpeername),
+#endif
+#ifdef __NR_uname
+	SC_ALLOW(__NR_uname),
+#endif
+#ifdef __NR_restart_syscall
+	SC_ALLOW(__NR_restart_syscall),
+#endif
+#ifdef __NR_setsockopt
+	SC_ALLOW_SETSOCKOPT(IPPROTO_IPV6, IPV6_TCLASS),
+	SC_ALLOW_SETSOCKOPT(IPPROTO_IP, IP_TOS),
+#endif
 #ifdef __NR_socketcall
+	SC_ALLOW_ARG(__NR_socketcall, 0, SYS_GETPEERNAME),
+	SC_ALLOW_ARG(__NR_socketcall, 0, SYS_GETSOCKNAME),
+	SC_ALLOW_ARG(__NR_socketcall, 0, SYS_GETSOCKOPT),
 	SC_ALLOW_ARG(__NR_socketcall, 0, SYS_SHUTDOWN),
 	SC_DENY(__NR_socketcall, EACCES),
 #endif
@@ -319,7 +514,7 @@ static const struct sock_filter preauth_insns[] = {
 	 * x86-64 syscall under some circumstances, e.g.
 	 * https://bugs.debian.org/849923
 	 */
-	SC_ALLOW(__NR_clock_gettime & ~__X32_SYSCALL_BIT),
+	SC_CLOCK(__NR_clock_gettime & ~__X32_SYSCALL_BIT),
 #endif
 
 	/* Default deny */
@@ -332,7 +527,7 @@ static const struct sock_fprog preauth_program = {
 };
 
 struct ssh_sandbox {
-	pid_t child_pid;
+	int junk;
 };
 
 struct ssh_sandbox *
@@ -344,16 +539,14 @@ ssh_sandbox_init(struct monitor *monitor)
 	 * Strictly, we don't need to maintain any state here but we need
 	 * to return non-NULL to satisfy the API.
 	 */
-	debug3("%s: preparing seccomp filter sandbox", __func__);
+	debug3_f("preparing seccomp filter sandbox");
 	box = xcalloc(1, sizeof(*box));
-	box->child_pid = 0;
-
 	return box;
 }
 
 #ifdef SANDBOX_SECCOMP_FILTER_DEBUG
 extern struct monitor *pmonitor;
-void mm_log_handler(LogLevel level, const char *msg, void *ctx);
+void mm_log_handler(LogLevel level, int forced, const char *msg, void *ctx);
 
 static void
 ssh_sandbox_violation(int signum, siginfo_t *info, void *void_context)
@@ -363,7 +556,7 @@ ssh_sandbox_violation(int signum, siginfo_t *info, void *void_context)
 	snprintf(msg, sizeof(msg),
 	    "%s: unexpected system call (arch:0x%x,syscall:%d @ %p)",
 	    __func__, info->si_arch, info->si_syscall, info->si_call_addr);
-	mm_log_handler(SYSLOG_LEVEL_FATAL, msg, pmonitor);
+	mm_log_handler(SYSLOG_LEVEL_FATAL, 0, msg, pmonitor);
 	_exit(1);
 }
 
@@ -373,7 +566,7 @@ ssh_sandbox_child_debugging(void)
 	struct sigaction act;
 	sigset_t mask;
 
-	debug3("%s: installing SIGSYS handler", __func__);
+	debug3_f("installing SIGSYS handler");
 	memset(&act, 0, sizeof(act));
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGSYS);
@@ -381,7 +574,7 @@ ssh_sandbox_child_debugging(void)
 	act.sa_sigaction = &ssh_sandbox_violation;
 	act.sa_flags = SA_SIGINFO;
 	if (sigaction(SIGSYS, &act, NULL) == -1)
-		fatal("%s: sigaction(SIGSYS): %s", __func__, strerror(errno));
+		fatal_f("sigaction(SIGSYS): %s", strerror(errno));
 	if (sigprocmask(SIG_UNBLOCK, &mask, NULL) == -1)
 		fatal("%s: sigprocmask(SIGSYS): %s",
 		    __func__, strerror(errno));
@@ -391,15 +584,18 @@ ssh_sandbox_child_debugging(void)
 void
 ssh_sandbox_child(struct ssh_sandbox *box)
 {
-	struct rlimit rl_zero;
-	int nnp_failed = 0;
+	struct rlimit rl_zero, rl_one = {.rlim_cur = 1, .rlim_max = 1};
 
 	/* Set rlimits for completeness if possible. */
 	rl_zero.rlim_cur = rl_zero.rlim_max = 0;
 	if (setrlimit(RLIMIT_FSIZE, &rl_zero) == -1)
 		fatal("%s: setrlimit(RLIMIT_FSIZE, { 0, 0 }): %s",
 			__func__, strerror(errno));
-	if (setrlimit(RLIMIT_NOFILE, &rl_zero) == -1)
+	/*
+	 * Cannot use zero for nfds, because poll(2) will fail with
+	 * errno=EINVAL if npfds>RLIMIT_NOFILE.
+	 */
+	if (setrlimit(RLIMIT_NOFILE, &rl_one) == -1)
 		fatal("%s: setrlimit(RLIMIT_NOFILE, { 0, 0 }): %s",
 			__func__, strerror(errno));
 	if (setrlimit(RLIMIT_NPROC, &rl_zero) == -1)
@@ -410,32 +606,12 @@ ssh_sandbox_child(struct ssh_sandbox *box)
 	ssh_sandbox_child_debugging();
 #endif /* SANDBOX_SECCOMP_FILTER_DEBUG */
 
-	debug3("%s: setting PR_SET_NO_NEW_PRIVS", __func__);
-	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1) {
-		debug("%s: prctl(PR_SET_NO_NEW_PRIVS): %s",
-		    __func__, strerror(errno));
-		nnp_failed = 1;
-	}
-	debug3("%s: attaching seccomp filter program", __func__);
+	debug3_f("setting PR_SET_NO_NEW_PRIVS");
+	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1)
+		fatal_f("prctl(PR_SET_NO_NEW_PRIVS): %s", strerror(errno));
+	debug3_f("attaching seccomp filter program");
 	if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &preauth_program) == -1)
-		debug("%s: prctl(PR_SET_SECCOMP): %s",
-		    __func__, strerror(errno));
-	else if (nnp_failed)
-		fatal("%s: SECCOMP_MODE_FILTER activated but "
-		    "PR_SET_NO_NEW_PRIVS failed", __func__);
-}
-
-void
-ssh_sandbox_parent_finish(struct ssh_sandbox *box)
-{
-	free(box);
-	debug3("%s: finished", __func__);
-}
-
-void
-ssh_sandbox_parent_preauth(struct ssh_sandbox *box, pid_t child_pid)
-{
-	box->child_pid = child_pid;
+		fatal_f("prctl(PR_SET_SECCOMP): %s", strerror(errno));
 }
 
 #endif /* SANDBOX_SECCOMP_FILTER */
